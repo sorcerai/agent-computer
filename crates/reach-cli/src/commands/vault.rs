@@ -49,6 +49,10 @@ pub struct SetArgs {
 pub struct GetArgs {
     /// Domain to retrieve
     pub domain: String,
+
+    /// Reveal plaintext password and TOTP secret (masked by default)
+    #[arg(long)]
+    pub reveal: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -75,6 +79,10 @@ pub struct InjectArgs {
     /// Sandbox container name or ID (auto-detected if omitted)
     #[arg(long)]
     pub target: Option<String>,
+
+    /// Skip checking active window title before injecting credentials
+    #[arg(long)]
+    pub no_verify_url: bool,
 }
 
 pub async fn run(args: VaultArgs) -> anyhow::Result<()> {
@@ -112,9 +120,25 @@ pub fn run_get(args: GetArgs) -> anyhow::Result<()> {
 
     println!("{:<12} {}", "Domain:".bold(), norm.cyan());
     println!("{:<12} {}", "Username:".bold(), cred.username);
-    println!("{:<12} {}", "Password:".bold(), cred.password);
+    if args.reveal {
+        println!("{:<12} {}", "Password:".bold(), cred.password);
+    } else {
+        println!(
+            "{:<12} {}",
+            "Password:".bold(),
+            "******** (use --reveal to display)".dimmed()
+        );
+    }
     if let Some(ref totp) = cred.totp_secret {
-        println!("{:<12} {}", "TOTP Secret:".bold(), totp);
+        if args.reveal {
+            println!("{:<12} {}", "TOTP Secret:".bold(), totp);
+        } else {
+            println!(
+                "{:<12} {}",
+                "TOTP Secret:".bold(),
+                "******** (use --reveal to display)".dimmed()
+            );
+        }
         if let Ok(code) = vault::totp_now(totp) {
             println!("{:<12} {}", "Current TOTP:".bold(), code.green().bold());
         }
@@ -209,6 +233,30 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
 
     tracing::info!(domain = %norm, target = %target, screen = args.screen, "injecting credentials");
 
+    // 0. Verify active window title matches target domain
+    if !args.no_verify_url {
+        let display = reach_cli::tools::display_for(args.screen);
+        let check_cmd =
+            format!("DISPLAY={display} xdotool getactivewindow getwindowname 2>/dev/null || true");
+        if let Ok(out) = docker
+            .exec(&target, &["bash".into(), "-c".into(), check_cmd])
+            .await
+        {
+            let win_title = out.stdout.trim().to_lowercase();
+            let domain_stem = norm.split('.').next().unwrap_or(&norm);
+            if !win_title.is_empty()
+                && !win_title.contains(&norm)
+                && !win_title.contains(domain_stem)
+            {
+                anyhow::bail!(
+                    "active window title '{}' does not match target domain '{}'. Aborting credential injection to prevent credential leakage. (Pass --no-verify-url to bypass)",
+                    out.stdout.trim(),
+                    norm
+                );
+            }
+        }
+    }
+
     // 1. Type username
     let resp = dispatch(
         &ctx,
@@ -256,25 +304,25 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
         anyhow::bail!("failed to type password: {:?}", resp.content);
     }
 
-    // 4. Type TOTP if configured
+    // 4. Submit password & handle TOTP 2FA if configured
     if let Some(ref totp_secret) = cred.totp_secret {
-        let code = vault::totp_now(totp_secret)?;
+        // Submit username & password
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let resp = dispatch(
+        let _ = dispatch(
             &ctx,
             "key",
             &serde_json::json!({
-                "combo": "Tab",
+                "combo": "Return",
                 "screen": args.screen,
             }),
             &target,
         )
         .await;
-        if resp.is_error {
-            anyhow::bail!("failed to press Tab for TOTP: {:?}", resp.content);
-        }
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Wait for 2FA screen to render
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let code = vault::totp_now(totp_secret)?;
         let resp = dispatch(
             &ctx,
             "type",
@@ -288,6 +336,18 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
         if resp.is_error {
             anyhow::bail!("failed to type TOTP: {:?}", resp.content);
         }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let _ = dispatch(
+            &ctx,
+            "key",
+            &serde_json::json!({
+                "combo": "Return",
+                "screen": args.screen,
+            }),
+            &target,
+        )
+        .await;
     }
 
     println!(
@@ -469,8 +529,15 @@ mod tests {
         // Get
         let get_res = run_get(GetArgs {
             domain: "github.com".to_string(),
+            reveal: false,
         });
         assert!(get_res.is_ok());
+
+        let get_reveal = run_get(GetArgs {
+            domain: "github.com".to_string(),
+            reveal: true,
+        });
+        assert!(get_reveal.is_ok());
 
         // List
         let list_res = run_list();

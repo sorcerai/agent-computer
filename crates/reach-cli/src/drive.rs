@@ -556,9 +556,12 @@ pub fn parse_action_from_text(text: &str) -> Result<ReachAction> {
         }
     }
 
-    // 3. Fallback: if text says terminate/done
+    // 3. Fallback: only if the text explicitly contains a clear completion marker
     let lower = text.to_lowercase();
-    if lower.contains("terminate") || lower.contains("goal achieved") || lower.contains("done") {
+    if lower.contains("goal achieved")
+        || lower.contains("task completed")
+        || lower.contains("action: terminate")
+    {
         return Ok(ReachAction {
             kind: "terminate".to_string(),
             description: text.chars().take(120).collect(),
@@ -576,7 +579,7 @@ pub async fn invoke_agy(
     screenshot_dir: &Path,
     prompt: &str,
 ) -> Result<String> {
-    let output = tokio::process::Command::new(agy_bin)
+    let cmd = tokio::process::Command::new(agy_bin)
         .arg("--model")
         .arg(model)
         .arg("--output-format")
@@ -589,8 +592,11 @@ pub async fn invoke_agy(
         .arg(screenshot_dir)
         .arg("-p")
         .arg(prompt)
-        .output()
+        .output();
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(60), cmd)
         .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for agy model response after 60s"))?
         .with_context(|| format!("Failed to execute agy binary at {:?}", agy_bin))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1268,24 +1274,26 @@ pub async fn drive(docker: &DockerClient, options: DriveOptions) -> Result<Drive
                     .as_deref()
                     .or(action.value.as_deref())
                     .unwrap_or("about:blank");
+                let profile = if options.screen > 0 {
+                    format!("default-screen{}", options.screen)
+                } else {
+                    "default".to_string()
+                };
                 (
                     "browse",
                     serde_json::json!({
                         "screen": options.screen,
                         "url": url,
-                        "use_profile": "default",
+                        "use_profile": profile,
                     }),
                 )
             }
-            _ => {
-                let (x, y) = action.point.unwrap_or((100, 100));
+            unknown => {
+                tracing::warn!(kind = %unknown, "unrecognized action kind from model");
                 (
-                    "click",
+                    "error",
                     serde_json::json!({
-                        "screen": options.screen,
-                        "x": x,
-                        "y": y,
-                        "button": action.button,
+                        "error": format!("unrecognized action kind '{unknown}'"),
                     }),
                 )
             }
@@ -1381,13 +1389,13 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     let result = drive(&docker, args.into()).await?;
 
     if result.success {
-        println!(
+        eprintln!(
             "{} Drive completed successfully! Goal: {}",
             "✓".green().bold(),
             goal.bold()
         );
     } else {
-        println!(
+        eprintln!(
             "{} Drive finished with status '{}': {}",
             "!".yellow().bold(),
             result.status.bold(),
@@ -1396,7 +1404,7 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     }
 
     if let Some(ref report) = result.audit_report_path {
-        println!(
+        eprintln!(
             "{} Visual audit report saved to {}",
             "✓".green(),
             report.bold()
@@ -1406,6 +1414,10 @@ pub async fn run(args: DriveArgs) -> Result<()> {
     // Output machine-readable JSON summary to stdout
     let json_str = serde_json::to_string_pretty(&result)?;
     println!("{json_str}");
+
+    if !result.success {
+        anyhow::bail!("drive finished with status: {}", result.status);
+    }
 
     Ok(())
 }
