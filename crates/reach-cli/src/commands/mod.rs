@@ -1,11 +1,13 @@
 pub mod connect;
 pub mod create;
 pub mod destroy;
+pub mod drive;
 pub mod exec;
 pub mod list;
 pub mod recreate;
 pub mod screenshot;
 pub mod serve;
+pub mod vault;
 pub mod vnc;
 
 use clap::Subcommand;
@@ -30,6 +32,10 @@ pub enum Command {
     Vnc(vnc::VncArgs),
     /// Capture a screenshot from a sandbox
     Screenshot(screenshot::ScreenshotArgs),
+    /// Manage credentials in native secret vault and generate TOTP codes
+    Vault(vault::VaultArgs),
+    /// Drive the sandbox via the CUA vision loop
+    Drive(drive::DriveArgs),
 }
 
 pub async fn run(cmd: Command) -> anyhow::Result<()> {
@@ -43,5 +49,7 @@ pub async fn run(cmd: Command) -> anyhow::Result<()> {
         Command::Serve(args) => serve::run(args).await,
         Command::Vnc(args) => vnc::run(args).await,
         Command::Screenshot(args) => screenshot::run(args).await,
+        Command::Vault(args) => vault::run(args).await,
+        Command::Drive(args) => drive::run(args).await,
     }
 }
