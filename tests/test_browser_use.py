@@ -42,6 +42,8 @@ class BrowserUseAdapterTests(unittest.TestCase):
         self.assertEqual(res["status"], "leased")
         self.assertEqual(res["screen"], 1)
         self.assertTrue(self.adapter._leased)
+        call_req = mock_urlopen.call_args[0][0]
+        self.assertIn(b'"owner": "browser-use"', call_req.data)
 
     @patch("urllib.request.urlopen")
     def test_lease_screen_supervisor_offline_falls_back_gracefully(self, mock_urlopen: MagicMock) -> None:
@@ -55,6 +57,7 @@ class BrowserUseAdapterTests(unittest.TestCase):
     @patch("urllib.request.urlopen")
     def test_release_screen(self, mock_urlopen: MagicMock) -> None:
         self.adapter._leased = True
+        self.adapter._owner = "test-worker"
         mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.__enter__.return_value = mock_resp
@@ -63,6 +66,8 @@ class BrowserUseAdapterTests(unittest.TestCase):
         ok = self.adapter.release_screen()
         self.assertTrue(ok)
         self.assertFalse(self.adapter._leased)
+        call_req = mock_urlopen.call_args[0][0]
+        self.assertIn(b'"owner": "test-worker"', call_req.data)
 
     @patch("urllib.request.urlopen")
     def test_context_manager(self, mock_urlopen: MagicMock) -> None:

@@ -1,6 +1,6 @@
 //! Native secret vault and RFC 6238 TOTP engine.
 //!
-//! Provides encrypted/restricted credential storage in `~/.reach/vault/secrets.json`
+//! Provides POSIX-restricted credential storage (0700 dir, 0600 file) in `~/.reach/vault/secrets.json`
 //! (or path configured via `REACH_VAULT_PATH` or `config.toml`), Unix permission enforcement
 //! (0700 dir, 0600 file), domain normalization, and standard Base32 / HMAC-SHA1 TOTP generation.
 

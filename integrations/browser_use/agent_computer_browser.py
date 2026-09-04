@@ -7,6 +7,7 @@ and screen lease lifecycle management.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -47,19 +48,21 @@ class AgentComputerBrowserAdapter:
         """Live noVNC browser viewport URL for human observation or takeover."""
         return f"http://{self.host}:{self.novnc_port}/vnc.html"
 
-    def lease_screen(self, duration_sec: int = 600) -> Dict[str, Any]:
+    def lease_screen(self, duration_sec: int = 600, owner: str = "browser-use") -> Dict[str, Any]:
         """Lease the target screen from Agent Computer supervisor to prevent collision."""
         url = f"{self.api_url}/agent/screens/{self.screen_id}/lease"
+        payload = json.dumps({"owner": owner}).encode()
         req = urllib.request.Request(
             url,
-            data=b"{}",
+            data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self._leased = True
-                logger.info(f"Leased screen {self.screen_id} for {duration_sec}s")
+                self._owner = owner
+                logger.info(f"Leased screen {self.screen_id} for {duration_sec}s (owner: {owner})")
                 return {"status": "leased", "screen": self.screen_id, "code": resp.status}
         except urllib.error.URLError as e:
             logger.warning(
@@ -73,11 +76,18 @@ class AgentComputerBrowserAdapter:
         if not self._leased:
             return True
         url = f"{self.api_url}/agent/screens/{self.screen_id}/lease"
-        req = urllib.request.Request(url, method="DELETE")
+        owner = getattr(self, "_owner", "browser-use")
+        payload = json.dumps({"owner": owner}).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self._leased = False
-                logger.info(f"Released screen {self.screen_id}")
+                logger.info(f"Released screen {self.screen_id} (owner: {owner})")
                 return resp.status in (200, 204)
         except urllib.error.URLError as e:
             logger.warning(f"Failed to release screen {self.screen_id} on supervisor: {e}")
