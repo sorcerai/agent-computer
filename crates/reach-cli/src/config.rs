@@ -1,0 +1,220 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+// ═══════════════════════════════════════════════════════════
+// CLI configuration — loaded from ~/.config/reach/config.toml
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct ReachConfig {
+    pub sandbox: SandboxDefaults,
+    pub server: ServerConfig,
+    pub docker: DockerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxDefaults {
+    /// Default Docker image
+    pub image: String,
+    /// Default display resolution
+    pub resolution: String,
+    /// Shared memory size in bytes
+    pub shm_size: u64,
+    /// Default VNC port
+    pub vnc_port: u16,
+    /// Default noVNC port
+    pub novnc_port: u16,
+    /// Default health API port
+    pub health_port: u16,
+    /// Root directory for persistent Chrome profiles on the host.
+    ///
+    /// Each `--persist-profile <name>` is materialised as a subdirectory
+    /// under this path. `None` means use the platform default
+    /// (`~/.local/share/reach/profiles`).
+    #[serde(default)]
+    pub profile_dir: Option<PathBuf>,
+    /// Hard memory limit for the container in bytes (`None` = unlimited).
+    #[serde(default)]
+    pub memory: Option<u64>,
+    /// Root directory for `/workspace` bind mounts on the host.
+    #[serde(default)]
+    pub workspace_dir: Option<PathBuf>,
+    /// Optional VNC password (`None` = no auth, matching prior behavior).
+    #[serde(default)]
+    pub vnc_password: Option<String>,
+}
+
+impl SandboxDefaults {
+    /// Resolve the directory used to store persistent Chrome profiles.
+    ///
+    /// Falls back to `$XDG_DATA_HOME/reach/profiles` (or
+    /// `~/.local/share/reach/profiles`) when `profile_dir` is unset.
+    pub fn resolved_profile_dir(&self) -> PathBuf {
+        self.profile_dir.clone().unwrap_or_else(default_profile_dir)
+    }
+
+    /// Resolve the directory used for `/workspace` bind mounts.
+    ///
+    /// Falls back to `$XDG_DATA_HOME/reach/workspaces` (or
+    /// `~/.local/share/reach/workspaces`) when `workspace_dir` is unset.
+    pub fn resolved_workspace_dir(&self) -> PathBuf {
+        self.workspace_dir
+            .clone()
+            .unwrap_or_else(default_workspace_dir)
+    }
+}
+
+/// XDG data home directory (or fallback to ~/.local/share).
+fn data_home() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".local").join("share")
+        })
+}
+
+/// Platform default for the persistent Chrome profile root.
+pub fn default_profile_dir() -> PathBuf {
+    data_home().join("reach").join("profiles")
+}
+
+/// Platform default for `/workspace` bind mounts: `~/.local/share/reach/workspaces`.
+pub fn default_workspace_dir() -> PathBuf {
+    data_home().join("reach").join("workspaces")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// MCP SSE server port
+    pub port: u16,
+    /// Bind address
+    pub host: String,
+    /// Hostname or IP that humans use to open noVNC (e.g. a Tailscale IP).
+    /// `None` = "localhost".
+    #[serde(default)]
+    pub public_host: Option<String>,
+}
+
+impl ServerConfig {
+    pub fn effective_public_host(&self) -> String {
+        self.public_host
+            .clone()
+            .unwrap_or_else(|| "localhost".into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct DockerConfig {
+    /// Docker socket path (empty = auto-detect)
+    pub socket: String,
+}
+
+impl DockerConfig {
+    /// Returns the configured socket path if set and non-empty.
+    pub fn socket_path(&self) -> Option<&str> {
+        let trimmed = self.socket.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Defaults
+// ═══════════════════════════════════════════════════════════
+
+impl Default for SandboxDefaults {
+    fn default() -> Self {
+        Self {
+            image: "reach:latest".into(),
+            resolution: "1280x720".into(),
+            shm_size: 512 * 1024 * 1024,
+            vnc_port: 5900,
+            novnc_port: 6080,
+            health_port: 8400,
+            profile_dir: None,
+            memory: None,
+            workspace_dir: None,
+            vnc_password: None,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 4200,
+            host: "127.0.0.1".into(),
+            public_host: None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Loading
+// ═══════════════════════════════════════════════════════════
+
+impl ReachConfig {
+    pub fn config_path() -> PathBuf {
+        dirs().join("config.toml")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::config_path();
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            toml::from_str(&content).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+}
+
+fn dirs() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".config")
+        });
+    base.join("reach")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_profile_dir_uses_explicit_override() {
+        let defaults = SandboxDefaults {
+            profile_dir: Some(PathBuf::from("/tmp/custom/profiles")),
+            ..SandboxDefaults::default()
+        };
+        assert_eq!(
+            defaults.resolved_profile_dir(),
+            PathBuf::from("/tmp/custom/profiles")
+        );
+    }
+
+    #[test]
+    fn resolved_profile_dir_falls_back_to_default() {
+        let defaults = SandboxDefaults::default();
+        let resolved = defaults.resolved_profile_dir();
+        assert!(resolved.ends_with("reach/profiles"));
+    }
+
+    #[test]
+    fn default_profile_dir_contains_reach_segment() {
+        let dir = default_profile_dir();
+        assert!(dir.to_string_lossy().contains("reach"));
+    }
+}
