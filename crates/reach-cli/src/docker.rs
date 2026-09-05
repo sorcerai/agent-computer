@@ -45,6 +45,10 @@ pub struct SandboxConfig {
     /// environment variable, it is visible to any process or user with access
     /// to `docker inspect`.
     pub vnc_password: Option<String>,
+    /// Whether the sandbox container allows arbitrary shell command execution via the `exec` tool.
+    pub allow_exec: bool,
+    /// Whether `/workspace` is mounted read-write. When false, `/workspace` is mounted read-only.
+    pub writable_workspace: bool,
 }
 
 impl std::fmt::Debug for SandboxConfig {
@@ -64,6 +68,8 @@ impl std::fmt::Debug for SandboxConfig {
                 "vnc_password",
                 &self.vnc_password.as_ref().map(|_| "<redacted>"),
             )
+            .field("allow_exec", &self.allow_exec)
+            .field("writable_workspace", &self.writable_workspace)
             .finish()
     }
 }
@@ -162,6 +168,8 @@ impl Default for SandboxConfig {
             memory: None,
             restart_unless_stopped: true,
             vnc_password: None,
+            allow_exec: false,
+            writable_workspace: false,
         }
     }
 }
@@ -178,6 +186,8 @@ pub struct Sandbox {
     pub image: String,
     pub ports: SandboxPortMapping,
     pub created_at: String,
+    #[serde(default)]
+    pub allow_exec: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -235,6 +245,8 @@ impl Labels {
     pub const PROFILE: &str = "reach.profile";
     pub const PROFILE_HOST: &str = "reach.profile_host";
     pub const WORKSPACE: &str = "reach.workspace";
+    pub const ALLOW_EXEC: &str = "reach.allow_exec";
+    pub const WRITABLE_WORKSPACE: &str = "reach.writable_workspace";
 
     pub fn for_sandbox(config: &SandboxConfig) -> HashMap<String, String> {
         let mut labels = HashMap::new();
@@ -243,6 +255,11 @@ impl Labels {
         labels.insert(Self::CREATED.into(), chrono::Utc::now().to_rfc3339());
         labels.insert(Self::RESOLUTION.into(), config.resolution.to_string());
         labels.insert(Self::SCREENS.into(), config.screens.to_string());
+        labels.insert(Self::ALLOW_EXEC.into(), config.allow_exec.to_string());
+        labels.insert(
+            Self::WRITABLE_WORKSPACE.into(),
+            config.writable_workspace.to_string(),
+        );
         if let Some(profile) = &config.profile {
             labels.insert(Self::PROFILE.into(), profile.name.clone());
             labels.insert(
@@ -273,6 +290,16 @@ fn bind(source: &std::path::Path, target: &str) -> Mount {
     }
 }
 
+fn bind_ro(source: &std::path::Path, target: &str, read_only: bool) -> Mount {
+    Mount {
+        target: Some(target.to_string()),
+        source: Some(source.to_string_lossy().into_owned()),
+        typ: Some(MountTypeEnum::BIND),
+        read_only: Some(read_only),
+        ..Default::default()
+    }
+}
+
 /// Bind mounts for a sandbox: persistent Chrome profile and `/workspace`.
 pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
     let mut v = Vec::new();
@@ -280,7 +307,11 @@ pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
         v.push(bind(&p.host_path, &p.container_path));
     }
     if let Some(ws) = &config.workspace {
-        v.push(bind(ws, WORKSPACE_CONTAINER_PATH));
+        v.push(bind_ro(
+            ws,
+            WORKSPACE_CONTAINER_PATH,
+            !config.writable_workspace,
+        ));
     }
     v
 }
@@ -396,6 +427,15 @@ pub fn config_from_inspect(
         }
     });
 
+    let allow_exec = labels
+        .get(Labels::ALLOW_EXEC)
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    let writable_workspace = labels
+        .get(Labels::WRITABLE_WORKSPACE)
+        .map(|s| s == "true")
+        .unwrap_or(false);
+
     Ok(SandboxConfig {
         name,
         image,
@@ -408,6 +448,8 @@ pub fn config_from_inspect(
         memory,
         restart_unless_stopped,
         vnc_password,
+        allow_exec,
+        writable_workspace,
     })
 }
 
@@ -604,6 +646,7 @@ impl DockerClient {
                 extra: config.ports.extra.clone(),
             },
             created_at: chrono::Utc::now().to_rfc3339(),
+            allow_exec: config.allow_exec,
         })
     }
 
@@ -657,6 +700,10 @@ impl DockerClient {
                     .get(Labels::SCREENS)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1);
+                let allow_exec = labels
+                    .get(Labels::ALLOW_EXEC)
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
                 let mut ports = extract_ports(&c.ports.unwrap_or_default());
                 ports.screens = screens;
 
@@ -667,6 +714,7 @@ impl DockerClient {
                     image: c.image.unwrap_or_default(),
                     ports,
                     created_at: labels.get(Labels::CREATED).cloned().unwrap_or_default(),
+                    allow_exec,
                 }
             })
             .collect();
@@ -771,6 +819,7 @@ impl DockerClient {
             "url": opts.url,
             "wait_for": opts.wait_for,
             "selector": opts.selector,
+            "format": opts.format,
             "timeout_ms": opts.timeout_ms,
             "user_data_dir": opts.user_data_dir,
             "hydrated_cookies": opts.hydrated_cookies,
@@ -970,6 +1019,7 @@ pub struct PageTextOptions {
     pub url: String,
     pub wait_for: Option<String>,
     pub selector: Option<String>,
+    pub format: Option<String>,
     pub timeout_ms: u64,
     /// Persistent Chrome user data dir inside the container.
     pub user_data_dir: Option<String>,
@@ -983,6 +1033,10 @@ pub struct PageTextOutput {
     pub status: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub axtree: Option<String>,
+    #[serde(default)]
+    pub refs: Option<std::collections::HashMap<String, crate::refs::ElementRef>>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
@@ -1074,9 +1128,11 @@ payload = json.loads(os.environ.get("REACH_PAGE_TEXT_PAYLOAD", "{}"))
 url = payload.get("url")
 wait_for = payload.get("wait_for")
 selector = payload.get("selector")
+format_mode = payload.get("format") or "both"
 timeout_ms = int(payload.get("timeout_ms") or 30000)
 user_data_dir = payload.get("user_data_dir")
 hydrated_cookies = payload.get("hydrated_cookies") or []
+screen_id = int(payload.get("screen") or 0)
 
 if not url:
     print(json.dumps({"status": "error", "message": "missing url"}))
@@ -1169,6 +1225,109 @@ try:
             else:
                 text = page.locator("body").inner_text()
 
+            # AXTree semantic reference extraction
+            ax_script = """
+            (() => {
+                const sel = 'a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"], [role="option"], [role="textbox"], [role="combobox"], [role="searchbox"], [role="heading"], h1, h2, h3, h4, h5, h6, [onclick], [tabindex]:not([tabindex="-1"])';
+                const elements = Array.from(document.querySelectorAll(sel));
+                const refs = {};
+                const treeLines = [];
+                let counter = 1;
+
+                for (const el of elements) {
+                    try {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                        if (rect.width <= 0 && rect.height <= 0) continue;
+
+                        const tag = el.tagName.toLowerCase();
+                        let role = el.getAttribute('role') || '';
+                        if (!role) {
+                            if (tag === 'input') {
+                                role = el.type || 'text';
+                            } else if (tag === 'a') {
+                                role = 'link';
+                            } else if (/^h[1-6]$/.test(tag)) {
+                                role = 'heading';
+                            } else {
+                                role = tag;
+                            }
+                        }
+
+                        let name = el.getAttribute('aria-label')
+                            || el.getAttribute('placeholder')
+                            || el.getAttribute('title')
+                            || (el.innerText || '').slice(0, 100)
+                            || (el.value || '').slice(0, 100)
+                            || '';
+                        name = name.replace(/\\s+/g, ' ').trim();
+
+                        const isHeading = role === 'heading';
+                        const isInteractive = !isHeading;
+
+                        const cx = Math.round(rect.left + rect.width / 2);
+                        const cy = Math.round(rect.top + rect.height / 2);
+                        const x = Math.round(rect.left);
+                        const y = Math.round(rect.top);
+                        const w = Math.round(rect.width);
+                        const h = Math.round(rect.height);
+
+                        let refKey = null;
+                        if (isInteractive) {
+                            refKey = 'e' + counter++;
+                            el.setAttribute('data-reach-ref', refKey);
+                            refs[refKey] = {
+                                ref: refKey,
+                                role: role,
+                                name: name,
+                                value: el.value || null,
+                                selector: '[data-reach-ref="' + refKey + '"]',
+                                point: [cx, cy],
+                                box_bounds: [x, y, w, h],
+                                focused: document.activeElement === el,
+                                disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true')
+                            };
+                        }
+
+                        let flags = [];
+                        if (document.activeElement === el) flags.push('focused');
+                        if (el.disabled || el.getAttribute('aria-disabled') === 'true') flags.push('disabled');
+                        if (role === 'password') flags.push('protected');
+                        const flagStr = flags.length ? ' (' + flags.join(', ') + ')' : '';
+                        const valStr = el.value && el.value !== name ? ' value="' + el.value.slice(0, 50) + '"' : '';
+
+                        if (isHeading) {
+                            treeLines.push('[heading "' + name + '"]');
+                        } else {
+                            treeLines.push('[@' + refKey + ': ' + role + ' "' + name + '"' + valStr + flagStr + ' x=' + x + ' y=' + y + ' w=' + w + ' h=' + h + ']');
+                        }
+                    } catch (e) {}
+                }
+
+                return {
+                    refs: refs,
+                    axtree: treeLines.join('\\n')
+                };
+            })()
+            """
+            ax_data = {"refs": {}, "axtree": ""}
+            try:
+                ax_data = page.evaluate(ax_script) or {"refs": {}, "axtree": ""}
+            except Exception:
+                pass
+
+            refs_out = ax_data.get("refs", {})
+            axtree_out = ax_data.get("axtree", "")
+
+            try:
+                refs_dir = "/workspace/.reach/refs"
+                os.makedirs(refs_dir, exist_ok=True)
+                with open(os.path.join(refs_dir, f"screen_{screen_id}.json"), "w") as rf:
+                    json.dump(refs_out, rf)
+            except Exception:
+                pass
+
             try:
                 cookies_out = ctx.cookies()
             except Exception:
@@ -1179,6 +1338,8 @@ try:
                 "url": page.url,
                 "title": page.title(),
                 "text": text,
+                "axtree": axtree_out,
+                "refs": refs_out,
                 "cookies": cookies_out,
             }
         finally:

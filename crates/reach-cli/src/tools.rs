@@ -160,10 +160,8 @@ pub fn resolve_profile_name(args: &serde_json::Value, screen: u32) -> (String, b
     } else if args.get("jars").is_some() {
         // Jars declared without explicit profile name: launch ephemeral browser context
         (format!("/tmp/ctx-{}", uuid::Uuid::new_v4()), true)
-    } else if screen > 0 {
-        (format!("default-screen{screen}"), false)
     } else {
-        ("default".to_string(), false)
+        (format!("screen-{screen}"), false)
     }
 }
 
@@ -308,12 +306,32 @@ pub async fn dispatch(
             Err(e) => ToolResponse::error(e.to_string()),
         },
         "click" => {
-            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
             let btn = match args.get("button").and_then(|v| v.as_str()) {
                 Some("right") => "3",
                 Some("middle") => "2",
                 _ => "1",
+            };
+            let reference = args.get("ref").and_then(|v| v.as_str());
+            let (x, y) = if let Some(ref_str) = reference {
+                match crate::refs::resolve_ref(target, screen, ref_str) {
+                    Some(el) => match el.target_coordinates() {
+                        Some(coords) => coords,
+                        None => {
+                            return ToolResponse::error(format!(
+                                "ref '{ref_str}' has no valid coordinates"
+                            ));
+                        }
+                    },
+                    None => {
+                        return ToolResponse::error(format!(
+                            "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
+                        ));
+                    }
+                }
+            } else {
+                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                (x, y)
             };
             sh(
                 ctx,
@@ -325,13 +343,45 @@ pub async fn dispatch(
         }
         "type" => {
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            sh(
-                ctx,
-                target,
-                screen,
-                &format!("xdotool type -- '{}'", text.replace('\'', "'\\''")),
-            )
-            .await
+            let reference = args.get("ref").and_then(|v| v.as_str());
+            let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if let Some(ref_str) = reference {
+                match crate::refs::resolve_ref(target, screen, ref_str) {
+                    Some(el) => {
+                        let (cx, cy) = match el.target_coordinates() {
+                            Some(coords) => coords,
+                            None => {
+                                return ToolResponse::error(format!(
+                                    "ref '{ref_str}' has no valid coordinates"
+                                ));
+                            }
+                        };
+                        let mut script = format!("xdotool mousemove {cx} {cy} click 1");
+                        if clear {
+                            script.push_str(" && xdotool key ctrl+a BackSpace");
+                        }
+                        script.push_str(&format!(
+                            " && xdotool type -- '{}'",
+                            text.replace('\'', "'\\''")
+                        ));
+                        sh(ctx, target, screen, &script).await
+                    }
+                    None => ToolResponse::error(format!(
+                        "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
+                    )),
+                }
+            } else {
+                let mut script = String::new();
+                if clear {
+                    script.push_str("xdotool key ctrl+a BackSpace && ");
+                }
+                script.push_str(&format!(
+                    "xdotool type -- '{}'",
+                    text.replace('\'', "'\\''")
+                ));
+                sh(ctx, target, screen, &script).await
+            }
         }
         "key" => {
             let combo = args
@@ -420,6 +470,20 @@ pub async fn dispatch(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("echo");
+            match ctx.docker.find(target).await {
+                Ok(sandbox) => {
+                    if !sandbox.allow_exec {
+                        return ToolResponse::error(format!(
+                            "exec capability denied: sandbox '{target}' was created without --allow-exec"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return ToolResponse::error(format!(
+                        "exec: failed to inspect sandbox '{target}': {e}"
+                    ));
+                }
+            }
             sh(ctx, target, screen, cmd).await
         }
         "page_text" => {
@@ -452,6 +516,10 @@ pub async fn dispatch(
                     .get("selector")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                format: args
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 timeout_ms: args
                     .get("timeout_ms")
                     .and_then(|v| v.as_u64())
@@ -462,6 +530,10 @@ pub async fn dispatch(
             };
             match ctx.docker.page_text(target, &opts).await {
                 Ok(out) => {
+                    if let Some(map) = &out.refs {
+                        crate::refs::global_ref_table().set_refs(target, screen, map.clone());
+                        crate::refs::save_refs_to_disk(target, screen, map);
+                    }
                     if !declared_jars.is_empty() && !out.cookies.is_empty() {
                         if let Some(jars_svc) = ctx.cookie_jars {
                             let _ = jars_svc.dump_cookies_to_jars(&out.cookies, &declared_jars);
@@ -480,8 +552,11 @@ pub async fn dispatch(
                 Some(u) if !u.is_empty() => u.to_string(),
                 _ => return ToolResponse::error("auth_handoff: missing required `url`"),
             };
+
+            let (profile_name, _) = resolve_profile_name(args, screen);
+
             let opts = AuthHandoffOptions {
-                url,
+                url: url.clone(),
                 wait_for_selector: args
                     .get("wait_for_selector")
                     .and_then(|v| v.as_str())
@@ -494,11 +569,7 @@ pub async fn dispatch(
                     .get("timeout_seconds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(300),
-                user_data_dir: Some(ProfileMount::container_path_for(
-                    args.get("use_profile")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default"),
-                )),
+                user_data_dir: Some(ProfileMount::container_path_for(&profile_name)),
                 display: Some(display.clone()),
                 storage_state: args.get("storage_state").and_then(|v| {
                     if let Some(s) = v.as_str() {
@@ -526,7 +597,10 @@ pub async fn dispatch(
                 Ok(out) => {
                     if let Some(agent) = ctx.agent {
                         if out.status == "auth_required" {
-                            let reason = opts.reason.clone().or_else(|| Some("takeover requested".to_string()));
+                            let reason = opts
+                                .reason
+                                .clone()
+                                .or_else(|| Some("takeover requested".to_string()));
                             let _ = agent.request_takeover(screen, reason, Some(vnc.clone()));
                         } else if out.status == "authenticated" {
                             let _ = agent.set_takeover(screen, false, None);
@@ -820,5 +894,22 @@ mod tests {
         let err_json: serde_json::Value = serde_json::from_str(content_text).unwrap();
         assert_eq!(err_json["error"], "profile_locked");
         assert_eq!(err_json["profile"], "work");
+    }
+
+    #[test]
+    fn test_resolve_profile_name_defaults_to_screen_id() {
+        let empty_args = serde_json::json!({});
+        let (prof0, eph0) = resolve_profile_name(&empty_args, 0);
+        assert_eq!(prof0, "screen-0");
+        assert!(!eph0);
+
+        let (prof1, eph1) = resolve_profile_name(&empty_args, 1);
+        assert_eq!(prof1, "screen-1");
+        assert!(!eph1);
+
+        let explicit_args = serde_json::json!({ "use_profile": "custom-prof" });
+        let (prof_custom, eph_custom) = resolve_profile_name(&explicit_args, 0);
+        assert_eq!(prof_custom, "custom-prof");
+        assert!(!eph_custom);
     }
 }
