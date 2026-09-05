@@ -93,6 +93,51 @@ class BrowserUseAdapterTests(unittest.TestCase):
                 self.adapter.create_browser()
             self.assertIn("pip install browser-use", str(ctx.exception))
 
+    @patch("urllib.request.urlopen")
+    def test_lease_token_captured_and_sent_on_release(self, mock_urlopen: MagicMock) -> None:
+        mock_lease_resp = MagicMock()
+        mock_lease_resp.status = 200
+        mock_lease_resp.read.return_value = b'{"status": "ok", "token": "test-crypto-token-123"}'
+        mock_lease_resp.__enter__.return_value = mock_lease_resp
+
+        mock_release_resp = MagicMock()
+        mock_release_resp.status = 200
+        mock_release_resp.read.return_value = b'{"status": "ok", "released": true}'
+        mock_release_resp.__enter__.return_value = mock_release_resp
+
+        mock_urlopen.side_effect = [mock_lease_resp, mock_release_resp]
+
+        res = self.adapter.lease_screen()
+        self.assertEqual(res["token"], "test-crypto-token-123")
+        self.assertEqual(self.adapter.lease_token, "test-crypto-token-123")
+
+        ok = self.adapter.release_screen()
+        self.assertTrue(ok)
+        self.assertIsNone(self.adapter.lease_token)
+
+        release_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(release_req.get_header("X-lease-token"), "test-crypto-token-123")
+
+    @patch("urllib.request.urlopen")
+    def test_bearer_auth_sent_when_configured(self, mock_urlopen: MagicMock) -> None:
+        adapter = AgentComputerBrowserAdapter(
+            screen_id=0,
+            auth_token="secret-bearer-token",
+        )
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"status": "ok"}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        adapter.lease_screen()
+        lease_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(lease_req.get_header("Authorization"), "Bearer secret-bearer-token")
+
+        adapter.release_screen()
+        release_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(release_req.get_header("Authorization"), "Bearer secret-bearer-token")
+
 
 if __name__ == "__main__":
     unittest.main()

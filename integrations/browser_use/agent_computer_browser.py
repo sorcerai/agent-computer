@@ -28,6 +28,7 @@ class AgentComputerBrowserAdapter:
         host: str = "127.0.0.1",
         cdp_port: Optional[int] = None,
         vault_path: Optional[Path] = None,
+        auth_token: Optional[str] = None,
     ) -> None:
         self.screen_id = screen_id
         self.api_url = api_url.rstrip("/")
@@ -36,7 +37,23 @@ class AgentComputerBrowserAdapter:
         self.cdp_port = cdp_port if cdp_port is not None else (9222 + screen_id)
         self.novnc_port = 6080 + screen_id
         self.vault_path = vault_path
+        self.auth_token = auth_token
         self._leased = False
+        self._lease_token: Optional[str] = None
+
+    @property
+    def lease_token(self) -> Optional[str]:
+        """Active screen lease token returned by the supervisor."""
+        return self._lease_token
+
+    def _get_headers(self, include_lease_token: bool = True) -> Dict[str, str]:
+        """Build request headers including auth and active lease token if available."""
+        headers = {"Content-Type": "application/json"}
+        if include_lease_token and self._lease_token:
+            headers["X-Lease-Token"] = self._lease_token
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
 
     @property
     def cdp_url(self) -> str:
@@ -52,23 +69,45 @@ class AgentComputerBrowserAdapter:
         """Lease the target screen from Agent Computer supervisor to prevent collision."""
         url = f"{self.api_url}/agent/screens/{self.screen_id}/lease"
         payload = json.dumps({"owner": owner}).encode()
+        headers = self._get_headers(include_lease_token=False)
         req = urllib.request.Request(
             url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self._leased = True
                 self._owner = owner
+                raw = None
+                if hasattr(resp, "read"):
+                    try:
+                        data = resp.read()
+                        if isinstance(data, (bytes, bytearray)):
+                            raw = data.decode("utf-8")
+                        elif isinstance(data, str):
+                            raw = data
+                    except Exception:
+                        pass
+                if raw:
+                    try:
+                        body = json.loads(raw)
+                        if isinstance(body, dict):
+                            self._lease_token = body.get("token")
+                    except Exception:
+                        pass
                 logger.info(f"Leased screen {self.screen_id} for {duration_sec}s (owner: {owner})")
-                return {"status": "leased", "screen": self.screen_id, "code": resp.status}
+                res = {"status": "leased", "screen": self.screen_id, "code": resp.status}
+                if self._lease_token:
+                    res["token"] = self._lease_token
+                return res
         except urllib.error.URLError as e:
             logger.warning(
                 f"Could not contact supervisor at {url} ({e}); continuing with standalone CDP connection."
             )
             self._leased = False
+            self._lease_token = None
             return {"status": "unsupervised", "screen": self.screen_id, "error": str(e)}
 
     def release_screen(self) -> bool:
@@ -78,15 +117,17 @@ class AgentComputerBrowserAdapter:
         url = f"{self.api_url}/agent/screens/{self.screen_id}/lease"
         owner = getattr(self, "_owner", "browser-use")
         payload = json.dumps({"owner": owner}).encode()
+        headers = self._get_headers(include_lease_token=True)
         req = urllib.request.Request(
             url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="DELETE",
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 self._leased = False
+                self._lease_token = None
                 logger.info(f"Released screen {self.screen_id} (owner: {owner})")
                 return resp.status in (200, 204)
         except urllib.error.URLError as e:
