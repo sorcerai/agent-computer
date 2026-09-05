@@ -1,9 +1,8 @@
-"""Unit tests for reach-agent-computer thin Hermes plugin."""
+"""Unit tests for reach-agent-computer Hermes plugin."""
 
 import http.server
 import json
 import os
-import subprocess
 import threading
 from typing import Any, Dict, List
 import unittest
@@ -13,11 +12,19 @@ from pathlib import Path
 import sys
 
 PLUGIN_DIR = Path(__file__).parent.resolve()
+REPO_ROOT = PLUGIN_DIR.parents[3].resolve()
+
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from __init__ import (  # noqa: E402
     get_state,
+    on_session_finalize,
+    on_session_start,
+    post_tool_call,
+    pre_tool_call,
     reach_drive,
     reach_lease_screen,
     reach_release_screen,
@@ -82,6 +89,19 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
                 return
             screen["owner"] = owner
             self._respond_json(200, {"status": "ok", "id": screen_id, "owner": owner})
+        elif self.path.startswith("/agent/screens/") and self.path.endswith(
+            "/takeover"
+        ):
+            screen_id = int(self.path.split("/")[3])
+            pending = body.get("pending", False)
+            url = body.get("url")
+            screen = next(
+                (s for s in self.server.screens if s["id"] == screen_id), None
+            )
+            if screen:
+                screen["takeover_pending"] = pending
+                screen["takeover_url"] = url
+            self._respond_json(200, {"status": "ok", "id": screen_id})
         else:
             self._respond_json(404, {"error": "not found"})
 
@@ -109,6 +129,8 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
                 self._respond_json(400, {"error": "not owner"})
                 return
             screen["owner"] = None
+            screen["takeover_pending"] = False
+            screen["takeover_url"] = None
             self._respond_json(200, {"status": "ok", "id": screen_id, "released": True})
         else:
             self._respond_json(404, {"error": "not found"})
@@ -120,18 +142,27 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
     def log_message(self, format: str, *args: Any) -> None:
+        # Silence server log output during test runs
         pass
 
 
 class FakeHermesContext:
     def __init__(self) -> None:
+        self.hooks: Dict[str, Any] = {}
         self.tools: Dict[str, Any] = {}
+        self.injected_messages: List[Dict[str, Any]] = []
+
+    def register_hook(self, name: str, fn: Any) -> None:
+        self.hooks[name] = fn
 
     def register_tool(self, name: str, fn: Any, description: str = "") -> None:
         self.tools[name] = fn
 
+    def inject_message(self, text: str, role: str = "user") -> None:
+        self.injected_messages.append({"text": text, "role": role})
 
-class ThinHermesShimTests(unittest.TestCase):
+
+class ReachAgentComputerPluginTests(unittest.TestCase):
     server: FakeReachServer
     server_thread: threading.Thread
     api_url: str
@@ -154,96 +185,165 @@ class ThinHermesShimTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_state()
         os.environ["REACH_AGENT_URL"] = self.api_url
-        os.environ["HERMES_PROFILE"] = "tester"
+        os.environ["HERMES_PROFILE"] = "piper"
+        # Reset server screens
         for s in self.server.screens:
             s["owner"] = None
+            s["takeover_pending"] = False
+            s["takeover_url"] = None
         self.server.requests_log.clear()
 
     def tearDown(self) -> None:
         reset_state()
 
-    def test_reach_status_queries_screens(self) -> None:
-        res = reach_status()
-        self.assertEqual(res["status"], "ok")
-        self.assertEqual(len(res["screens"]), 2)
+    def test_on_session_start_leases_screen_and_notifies(self) -> None:
+        ctx = FakeHermesContext()
+        on_session_start(ctx, session_id="s1", model="gemini-3.8-flash", platform="cli")
 
-    def test_reach_status_single_screen(self) -> None:
-        res0 = reach_status(screen=0)
-        self.assertEqual(res0["status"], "ok")
-        self.assertEqual(res0["screen"]["id"], 0)
+        state = get_state()
+        self.assertEqual(state["screen"], 0)
+        self.assertEqual(state["owner"], "piper")
+        self.assertTrue(len(ctx.injected_messages) > 0)
+        msg = ctx.injected_messages[0]["text"]
+        self.assertIn("screen 0 leased", msg)
+        self.assertIn("http://127.0.0.1:6080/vnc.html", msg)
 
-        res_none = reach_status(screen=99)
-        self.assertEqual(res_none["status"], "not_found")
-
-    def test_reach_lease_screen_auto_and_release(self) -> None:
-        # Auto-lease screen
-        lease = reach_lease_screen()
-        self.assertEqual(lease["status"], "ok")
-        self.assertEqual(lease["screen"], 0)
-        self.assertEqual(get_state()["screen"], 0)
-        self.assertEqual(self.server.screens[0]["owner"], "tester")
-
-        # Release screen
-        rel = reach_release_screen()
-        self.assertEqual(rel["status"], "ok")
-        self.assertEqual(rel["screen"], 0)
-        self.assertIsNone(get_state()["screen"])
-        self.assertIsNone(self.server.screens[0]["owner"])
-
-    def test_reach_lease_explicit_screen(self) -> None:
-        lease = reach_lease_screen(screen=1, owner="custom_user")
-        self.assertEqual(lease["status"], "ok")
-        self.assertEqual(lease["screen"], 1)
-        self.assertEqual(lease["owner"], "custom_user")
-        self.assertEqual(self.server.screens[1]["owner"], "custom_user")
-
-    def test_reach_lease_screen_exhausted(self) -> None:
+    def test_on_session_start_when_screens_exhausted(self) -> None:
+        # Mark all screens occupied
         for s in self.server.screens:
-            s["owner"] = "someone_else"
+            s["owner"] = "other_profile"
 
-        res = reach_lease_screen()
-        self.assertEqual(res["status"], "exhausted")
+        ctx = FakeHermesContext()
+        on_session_start(ctx, session_id="s2")
 
-    def test_reach_lease_screen_conflict(self) -> None:
-        self.server.screens[0]["owner"] = "other_user"
-        res = reach_lease_screen(screen=0, owner="me")
-        self.assertEqual(res["status"], "conflict")
+        state = get_state()
+        self.assertIsNone(state["screen"])
+        self.assertTrue(
+            any(
+                "No free Agent Computer screen" in m["text"]
+                for m in ctx.injected_messages
+            )
+        )
 
-    @patch("subprocess.run")
-    def test_reach_drive_delegates_to_cli(self, mock_run: MagicMock) -> None:
-        mock_proc = MagicMock()
-        mock_proc.returncode = 0
-        mock_proc.stdout = json.dumps({
+    def test_on_session_start_when_api_down(self) -> None:
+        os.environ["REACH_AGENT_URL"] = "http://127.0.0.1:65530"  # unreachable
+        ctx = FakeHermesContext()
+        on_session_start(ctx, session_id="s3")
+
+        state = get_state()
+        self.assertIsNone(state["screen"])
+        self.assertTrue(
+            any(
+                "Agent Computer unavailable" in m["text"] for m in ctx.injected_messages
+            )
+        )
+
+    def test_pre_tool_call_injects_leased_screen(self) -> None:
+        # Pre-set leased screen in state
+        ctx = FakeHermesContext()
+        on_session_start(ctx, session_id="s1")
+
+        # Reach tool lacking screen argument
+        mod = pre_tool_call(
+            tool_name="reach_page_text", args={"url": "https://example.com"}
+        )
+        self.assertEqual(mod, {"modify": {"screen": 0}})
+
+        # Non-reach tool is ignored
+        mod_terminal = pre_tool_call(tool_name="terminal", args={"command": "ls"})
+        self.assertIsNone(mod_terminal)
+
+        # Reach tool with explicit screen argument is not overridden
+        mod_explicit = pre_tool_call(
+            tool_name="reach_click", args={"screen": 1, "x": 50, "y": 50}
+        )
+        self.assertIsNone(mod_explicit)
+
+    def test_post_tool_call_triggers_takeover(self) -> None:
+        ctx = FakeHermesContext()
+        on_session_start(ctx, session_id="s1")
+
+        auth_result = json.dumps(
+            {
+                "status": "auth_required",
+                "vnc_url": "http://127.0.0.1:6080/vnc.html?autoconnect=1",
+            }
+        )
+        post_tool_call(
+            "reach_auth_handoff", {"url": "https://login.example.com"}, auth_result
+        )
+
+        screen = self.server.screens[0]
+        self.assertTrue(screen["takeover_pending"])
+        self.assertEqual(
+            screen["takeover_url"], "http://127.0.0.1:6080/vnc.html?autoconnect=1"
+        )
+
+    def test_on_session_finalize_releases_lease(self) -> None:
+        ctx = FakeHermesContext()
+        on_session_start(ctx, session_id="s1")
+        self.assertEqual(self.server.screens[0]["owner"], "piper")
+
+        on_session_finalize(session_id="s1")
+        self.assertIsNone(self.server.screens[0]["owner"])
+        self.assertIsNone(get_state()["screen"])
+
+    def test_tools_lease_release_and_status(self) -> None:
+        # Test reach_status initially free
+        st = reach_status()
+        self.assertEqual(st["status"], "ok")
+        self.assertEqual(len(st["screens"]), 2)
+
+        # Lease screen 1 explicitly
+        lease_res = reach_lease_screen(screen=1, owner="tester")
+        self.assertEqual(lease_res["status"], "ok")
+        self.assertEqual(lease_res["screen"], 1)
+        self.assertEqual(get_state()["screen"], 1)
+
+        # Check status of screen 1
+        st1 = reach_status(screen=1)
+        self.assertEqual(st1["status"], "ok")
+        self.assertEqual(st1["screen"]["owner"], "tester")
+
+        # Release screen 1
+        rel_res = reach_release_screen(screen=1, owner="tester")
+        self.assertEqual(rel_res["status"], "ok")
+        self.assertIsNone(get_state()["screen"])
+
+    @patch("scripts.reach_drive.ReachDriver")
+    def test_reach_drive_tool(self, mock_driver_cls: MagicMock) -> None:
+        mock_driver_instance = MagicMock()
+        mock_driver_cls.return_value = mock_driver_instance
+
+        mock_result = MagicMock()
+        mock_result.to_dict.return_value = {
             "success": True,
             "status": "completed",
-            "goal": "Test goal",
             "final_description": "Goal achieved",
             "steps": [],
-        })
-        mock_proc.stderr = ""
-        mock_run.return_value = mock_proc
+        }
+        mock_driver_instance.drive.return_value = mock_result
 
-        result = reach_drive(goal="Test goal", screen=0, max_steps=10)
-        self.assertEqual(result["status"], "completed")
-        self.assertTrue(result["success"])
+        out = reach_drive(goal="Log in and check dashboard", screen=0)
+        self.assertEqual(out["status"], "completed")
+        self.assertTrue(out["success"])
+        mock_driver_instance.drive.assert_called_once_with(
+            goal="Log in and check dashboard", initial_url=None
+        )
 
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        self.assertIn("drive", cmd)
-        self.assertIn("--goal", cmd)
-        self.assertIn("Test goal", cmd)
-        self.assertIn("--screen", cmd)
-        self.assertIn("0", cmd)
-        self.assertIn("--max-steps", cmd)
-        self.assertIn("10", cmd)
-
-    def test_register_adds_tools(self) -> None:
+    def test_register_attaches_hooks_and_tools(self) -> None:
         ctx = FakeHermesContext()
         register(ctx)
+
+        self.assertIn("on_session_start", ctx.hooks)
+        self.assertIn("pre_tool_call", ctx.hooks)
+        self.assertIn("post_tool_call", ctx.hooks)
+        self.assertIn("on_session_finalize", ctx.hooks)
+
         self.assertIn("reach_lease_screen", ctx.tools)
         self.assertIn("reach_release_screen", ctx.tools)
-        self.assertIn("reach_status", ctx.tools)
         self.assertIn("reach_drive", ctx.tools)
+        self.assertIn("reach_status", ctx.tools)
 
 
 if __name__ == "__main__":

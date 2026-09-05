@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +38,9 @@ DEFAULT_API_URL = os.environ.get("REACH_AGENT_URL", "http://127.0.0.1:4200")
 DEFAULT_MODEL = "gemini-3.8-flash-high"
 DEFAULT_AGY_BIN = os.environ.get("AGY_BIN", "/Users/ahpramesi/.local/bin/agy")
 DEFAULT_TIMEOUT_SEC = 120
+
+ESTIMATED_TOKENS_PER_VLM_CALL = 1600
+ESTIMATED_COST_PER_VLM_CALL_USD = 0.00024
 
 DEFAULT_MUTATION_PATTERNS = [
     r"\b(delete|destroy|remove|drop\s+table|wipe|purge|truncate)\b",
@@ -84,8 +89,40 @@ AUTH_SIGNALS_RE = re.compile(
 
 
 @dataclass
+class Roi:
+    x: int
+    y: int
+    width: int
+    height: int
+
+    def to_list(self) -> List[int]:
+        return [self.x, self.y, self.width, self.height]
+
+    @classmethod
+    def from_value(cls, val: Any) -> Optional[Roi]:
+        if val is None:
+            return None
+        if isinstance(val, Roi):
+            return val
+        if isinstance(val, (list, tuple)) and len(val) >= 4:
+            return cls(int(val[0]), int(val[1]), int(val[2]), int(val[3]))
+        if isinstance(val, str):
+            parts = [int(p.strip()) for p in val.split(",") if p.strip()]
+            if len(parts) >= 4:
+                return cls(parts[0], parts[1], parts[2], parts[3])
+        if isinstance(val, dict):
+            return cls(
+                int(val.get("x", 0)),
+                int(val.get("y", 0)),
+                int(val.get("width", val.get("w", 0))),
+                int(val.get("height", val.get("h", 0))),
+            )
+        return None
+
+
+@dataclass
 class ReachAction:
-    kind: str  # click | type | key | navigate | auth_required | terminate
+    kind: str  # click | type | key | navigate | wait | scroll | auth_required | terminate
     action_class: str = "read_only"
     point: Optional[Tuple[int, int]] = None
     target: Optional[str] = None
@@ -94,6 +131,7 @@ class ReachAction:
     button: str = "left"
     description: str = ""
     requires_approval: bool = False
+    roi: Optional[List[int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -113,6 +151,8 @@ class ReachAction:
             d["button"] = self.button
         if self.requires_approval:
             d["requires_approval"] = True
+        if self.roi is not None:
+            d["roi"] = self.roi
         return d
 
 
@@ -126,6 +166,10 @@ class StepRecord:
     timestamp: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    vlm_cached: bool = False
+    visual_change: Optional[float] = None
+    roi: Optional[List[int]] = None
+    roi_crop_path: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -140,6 +184,14 @@ class StepRecord:
             d["after_screenshot_path"] = self.after_screenshot_path
         if self.timestamp is not None:
             d["timestamp"] = self.timestamp
+        if self.vlm_cached:
+            d["vlm_cached"] = True
+        if self.visual_change is not None:
+            d["visual_change"] = round(self.visual_change, 4)
+        if self.roi is not None:
+            d["roi"] = self.roi
+        if self.roi_crop_path is not None:
+            d["roi_crop_path"] = self.roi_crop_path
         return d
 
 
@@ -153,6 +205,10 @@ class DriveResult:
     task_id: Optional[str] = None
     audit_report_path: Optional[str] = None
     error: Optional[str] = None
+    skipped_vlm_ticks: int = 0
+    tokens_saved: int = 0
+    cost_saved: float = 0.0
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -161,13 +217,406 @@ class DriveResult:
             "final_description": self.final_description,
             "takeover_url": self.takeover_url,
             "error": self.error,
+            "skipped_vlm_ticks": self.skipped_vlm_ticks,
+            "tokens_saved": self.tokens_saved,
+            "cost_saved": round(self.cost_saved, 5),
             "steps": [s.to_dict() for s in self.steps],
         }
         if self.task_id is not None:
             d["task_id"] = self.task_id
         if self.audit_report_path is not None:
             d["audit_report_path"] = self.audit_report_path
+        if self.metrics:
+            d["metrics"] = self.metrics
         return d
+
+
+def _read_image_bytes(img_input: Union[bytes, str, Path]) -> bytes:
+    if isinstance(img_input, bytes):
+        return img_input
+    if isinstance(img_input, (str, Path)):
+        if not os.path.exists(img_input):
+            return base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            )
+        try:
+            with open(img_input, "rb") as f:
+                return f.read()
+        except Exception:
+            return base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            )
+    return b""
+
+
+def _decode_png(png_bytes: bytes) -> Tuple[int, int, int, int, bytearray]:
+    """Decode PNG bytes into (width, height, color_type, bpp, raw_pixels)."""
+    if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Invalid PNG signature")
+    idx = 8
+    width = height = bit_depth = color_type = None
+    idat_chunks = []
+    while idx < len(png_bytes):
+        length, chunk_type = struct.unpack(">I4s", png_bytes[idx : idx + 8])
+        idx += 8
+        data = png_bytes[idx : idx + length]
+        idx += length + 4  # skip CRC
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type = struct.unpack(">IIBB", data[:10])
+        elif chunk_type == b"IDAT":
+            idat_chunks.append(data)
+        elif chunk_type == b"IEND":
+            break
+
+    if width is None or height is None or color_type is None:
+        raise ValueError("Malformed PNG: missing IHDR")
+
+    decompressed = zlib.decompress(b"".join(idat_chunks))
+    bpp_map = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+    bpp = bpp_map.get(color_type, 3)
+    stride = width * bpp
+
+    raw_pixels = bytearray(width * height * bpp)
+    src_pos = 0
+    for y in range(height):
+        filter_type = decompressed[src_pos]
+        src_pos += 1
+        line = decompressed[src_pos : src_pos + stride]
+        src_pos += stride
+        dst_pos = y * stride
+        prev_dst_pos = (y - 1) * stride if y > 0 else None
+
+        if filter_type == 0:  # None
+            raw_pixels[dst_pos : dst_pos + stride] = line
+        elif filter_type == 1:  # Sub
+            for x in range(stride):
+                left = raw_pixels[dst_pos + x - bpp] if x >= bpp else 0
+                raw_pixels[dst_pos + x] = (line[x] + left) & 0xFF
+        elif filter_type == 2:  # Up
+            for x in range(stride):
+                up = raw_pixels[prev_dst_pos + x] if prev_dst_pos is not None else 0
+                raw_pixels[dst_pos + x] = (line[x] + up) & 0xFF
+        elif filter_type == 3:  # Average
+            for x in range(stride):
+                left = raw_pixels[dst_pos + x - bpp] if x >= bpp else 0
+                up = raw_pixels[prev_dst_pos + x] if prev_dst_pos is not None else 0
+                raw_pixels[dst_pos + x] = (line[x] + ((left + up) >> 1)) & 0xFF
+        elif filter_type == 4:  # Paeth
+            for x in range(stride):
+                left = raw_pixels[dst_pos + x - bpp] if x >= bpp else 0
+                up = raw_pixels[prev_dst_pos + x] if prev_dst_pos is not None else 0
+                up_left = (
+                    raw_pixels[prev_dst_pos + x - bpp]
+                    if (prev_dst_pos is not None and x >= bpp)
+                    else 0
+                )
+                p = left + up - up_left
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+                pr = left if (pa <= pb and pa <= pc) else (up if pb <= pc else up_left)
+                raw_pixels[dst_pos + x] = (line[x] + pr) & 0xFF
+
+    return width, height, color_type, bpp, raw_pixels
+
+
+def _encode_png(width: int, height: int, color_type: int, raw_pixels: bytes) -> bytes:
+    """Encode raw pixels into a standard valid PNG byte sequence."""
+    bpp_map = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+    bpp = bpp_map.get(color_type, 3)
+    stride = width * bpp
+    filtered_data = bytearray()
+    for y in range(height):
+        filtered_data.append(0)  # filter type None
+        row_start = y * stride
+        filtered_data.extend(raw_pixels[row_start : row_start + stride])
+
+    compressed = zlib.compress(filtered_data)
+
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", compressed)
+        + _chunk(b"IEND", b"")
+    )
+
+
+def downsample_to_grayscale(
+    img_input: Union[bytes, str, Path],
+    target_w: int = 16,
+    target_h: int = 16,
+) -> List[int]:
+    """Downsample image to target_w x target_h grayscale values (0..255)."""
+    png_bytes = _read_image_bytes(img_input)
+    # Check if PIL is available for accelerated resizing
+    try:
+        from PIL import Image
+        import io
+
+        im = Image.open(io.BytesIO(png_bytes)).convert("L")
+        resized = im.resize((target_w, target_h), Image.Resampling.BILINEAR)
+        return list(resized.getdata())
+    except Exception:
+        pass
+
+    # Pure Python fallback
+    width, height, color_type, bpp, raw = _decode_png(png_bytes)
+    out: List[int] = []
+    for ty in range(target_h):
+        y0 = ty * height // target_h
+        y1 = max(y0 + 1, (ty + 1) * height // target_h)
+        for tx in range(target_w):
+            x0 = tx * width // target_w
+            x1 = max(x0 + 1, (tx + 1) * width // target_w)
+            sum_lum = 0
+            count = 0
+            for y in range(y0, y1):
+                row_start = y * width * bpp
+                for x in range(x0, x1):
+                    p_idx = row_start + x * bpp
+                    if bpp == 1:
+                        sum_lum += raw[p_idx]
+                    else:
+                        r, g, b = raw[p_idx], raw[p_idx + 1], raw[p_idx + 2]
+                        sum_lum += (299 * r + 587 * g + 114 * b) // 1000
+                    count += 1
+            out.append(sum_lum // max(1, count))
+    return out
+
+
+def compute_dhash(img_input: Union[bytes, str, Path], size: int = 8) -> int:
+    """Compute difference hash (dHash) as an integer bitmask."""
+    gray = downsample_to_grayscale(img_input, target_w=size + 1, target_h=size)
+    dhash = 0
+    for y in range(size):
+        row_offset = y * (size + 1)
+        for x in range(size):
+            p_left = gray[row_offset + x]
+            p_right = gray[row_offset + x + 1]
+            bit = 1 if p_right > p_left else 0
+            dhash = (dhash << 1) | bit
+    return dhash
+
+
+def compute_phash(img_input: Union[bytes, str, Path], size: int = 8) -> int:
+    """Compute average perceptual hash (pHash / aHash) as an integer bitmask."""
+    gray = downsample_to_grayscale(img_input, target_w=size, target_h=size)
+    mean = sum(gray) / len(gray)
+    phash = 0
+    for val in gray:
+        bit = 1 if val >= mean else 0
+        phash = (phash << 1) | bit
+    return phash
+
+
+def calculate_visual_change(
+    prev_img: Union[bytes, str, Path],
+    curr_img: Union[bytes, str, Path],
+    size: int = 16,
+) -> float:
+    """Calculate visual distance percentage between two frames (0.0 to 1.0)."""
+    b1 = _read_image_bytes(prev_img)
+    b2 = _read_image_bytes(curr_img)
+    if b1 == b2:
+        return 0.0
+
+    g1 = downsample_to_grayscale(b1, target_w=size, target_h=size)
+    g2 = downsample_to_grayscale(b2, target_w=size, target_h=size)
+    diff = sum(abs(p1 - p2) for p1, p2 in zip(g1, g2)) / (255.0 * len(g1))
+    return max(0.0, min(1.0, diff))
+
+
+def crop_image(
+    img_input: Union[bytes, str, Path],
+    roi: Roi,
+    out_path: Optional[Union[str, Path]] = None,
+) -> bytes:
+    """Crop Region of Interest (ROI) from an image and return PNG bytes."""
+    png_bytes = _read_image_bytes(img_input)
+
+    # Fast path with PIL if present
+    try:
+        from PIL import Image
+        import io
+
+        im = Image.open(io.BytesIO(png_bytes))
+        w, h = im.size
+        cx = max(0, min(roi.x, w - 1))
+        cy = max(0, min(roi.y, h - 1))
+        cw = max(1, min(roi.width, w - cx))
+        ch = max(1, min(roi.height, h - cy))
+        cropped = im.crop((cx, cy, cx + cw, cy + ch))
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        res_bytes = buf.getvalue()
+        if out_path:
+            with open(out_path, "wb") as f:
+                f.write(res_bytes)
+        return res_bytes
+    except Exception:
+        pass
+
+    # Pure Python PNG cropping
+    w, h, color_type, bpp, raw = _decode_png(png_bytes)
+    cx = max(0, min(roi.x, w - 1))
+    cy = max(0, min(roi.y, h - 1))
+    cw = max(1, min(roi.width, w - cx))
+    ch = max(1, min(roi.height, h - cy))
+
+    stride = w * bpp
+    crop_stride = cw * bpp
+    cropped_raw = bytearray()
+    for row in range(cy, cy + ch):
+        start = row * stride + cx * bpp
+        cropped_raw.extend(raw[start : start + crop_stride])
+
+    out_png = _encode_png(cw, ch, color_type, bytes(cropped_raw))
+    if out_path:
+        with open(out_path, "wb") as f:
+            f.write(out_png)
+    return out_png
+
+
+def is_wait_or_scroll_action(action: Optional[ReachAction]) -> bool:
+    """Check whether an action is a wait, scroll, or settle operation."""
+    if action is None:
+        return False
+    kind = (action.kind or "").strip().lower()
+    if kind in ("wait", "scroll", "sleep"):
+        return True
+    if kind == "key" and action.key:
+        k = action.key.lower()
+        if any(x in k for x in ("page", "down", "up", "scroll", "space")):
+            return True
+    desc = (action.description or "").lower()
+    return any(w in desc for w in ("wait", "scroll", "settle", "loading", "sleep"))
+
+
+@dataclass
+class GateDecision:
+    should_skip_vlm: bool
+    visual_distance: float
+    unchanged_ticks: int
+    reason: str
+    backoff_sec: float = 0.75
+
+
+class PerceptualChangeGate:
+    """Perceptual hash change-detection gate preventing VLM token burn on static screens."""
+
+    def __init__(
+        self,
+        min_change_threshold: float = 0.01,
+        max_unchanged_ticks: int = 3,
+        backoff_sec: float = 0.75,
+    ) -> None:
+        self.min_change_threshold = min_change_threshold
+        self.max_unchanged_ticks = max_unchanged_ticks
+        self.backoff_sec = backoff_sec
+        self.previous_frame_bytes: Optional[bytes] = None
+        self.unchanged_ticks: int = 0
+        self.skipped_vlm_ticks: int = 0
+        self.total_vlm_calls: int = 0
+        self.total_frames_evaluated: int = 0
+
+    def evaluate(
+        self,
+        current_frame: Union[bytes, str, Path],
+        last_action_was_wait_or_scroll: bool,
+    ) -> GateDecision:
+        self.total_frames_evaluated += 1
+        curr_bytes = _read_image_bytes(current_frame)
+
+        if self.previous_frame_bytes is None:
+            self.previous_frame_bytes = curr_bytes
+            self.unchanged_ticks = 0
+            self.total_vlm_calls += 1
+            return GateDecision(
+                should_skip_vlm=False,
+                visual_distance=1.0,
+                unchanged_ticks=0,
+                reason="Initial observation frame; invoking VLM",
+                backoff_sec=0.0,
+            )
+
+        try:
+            distance = calculate_visual_change(self.previous_frame_bytes, curr_bytes)
+        except Exception as e:
+            logger.debug(
+                "Failed calculating visual change (%s), defaulting to changed", e
+            )
+            distance = 1.0
+
+        self.previous_frame_bytes = curr_bytes
+        is_subthreshold = distance < self.min_change_threshold
+
+        if is_subthreshold and last_action_was_wait_or_scroll:
+            if self.unchanged_ticks < self.max_unchanged_ticks:
+                self.unchanged_ticks += 1
+                self.skipped_vlm_ticks += 1
+                return GateDecision(
+                    should_skip_vlm=True,
+                    visual_distance=distance,
+                    unchanged_ticks=self.unchanged_ticks,
+                    reason=(
+                        f"Visual change {distance * 100.0:.2f}% below threshold "
+                        f"({self.min_change_threshold * 100.0:.1f}%) after wait/scroll; "
+                        f"skipping VLM ({self.unchanged_ticks}/{self.max_unchanged_ticks} ticks)"
+                    ),
+                    backoff_sec=self.backoff_sec,
+                )
+            else:
+                self.unchanged_ticks = 0
+                self.total_vlm_calls += 1
+                return GateDecision(
+                    should_skip_vlm=False,
+                    visual_distance=distance,
+                    unchanged_ticks=0,
+                    reason=(
+                        f"Maximum unchanged ticks ({self.max_unchanged_ticks}) reached; "
+                        "forcing VLM invocation"
+                    ),
+                    backoff_sec=0.0,
+                )
+
+        self.unchanged_ticks = 0
+        self.total_vlm_calls += 1
+        reason = (
+            f"Frame changed by {distance * 100.0:.2f}%; invoking VLM"
+            if not is_subthreshold
+            else "Previous action was not wait/scroll; invoking VLM"
+        )
+        return GateDecision(
+            should_skip_vlm=False,
+            visual_distance=distance,
+            unchanged_ticks=0,
+            reason=reason,
+            backoff_sec=0.0,
+        )
+
+    @property
+    def cache_hit_rate(self) -> float:
+        total = self.total_vlm_calls + self.skipped_vlm_ticks
+        return (self.skipped_vlm_ticks / total) if total > 0 else 0.0
+
+    @property
+    def tokens_saved(self) -> int:
+        return self.skipped_vlm_ticks * ESTIMATED_TOKENS_PER_VLM_CALL
+
+    @property
+    def cost_saved(self) -> float:
+        return self.skipped_vlm_ticks * ESTIMATED_COST_PER_VLM_CALL_USD
+
+    def reset(self) -> None:
+        self.previous_frame_bytes = None
+        self.unchanged_ticks = 0
 
 
 class ApprovalGate:
@@ -276,6 +725,17 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
     start_time = html.escape(str(meta.get("start_time", "")))
     steps_data = meta.get("steps", [])
 
+    skipped_vlm_ticks = int(
+        meta.get("skipped_vlm_ticks")
+        or meta.get("metrics", {}).get("skipped_vlm_ticks", 0)
+    )
+    tokens_saved = int(
+        meta.get("tokens_saved") or meta.get("metrics", {}).get("tokens_saved", 0)
+    )
+    cost_saved = float(
+        meta.get("cost_saved") or meta.get("metrics", {}).get("cost_saved", 0.0)
+    )
+
     status_class = "status-completed" if success else f"status-{status.lower()}"
 
     steps_html = []
@@ -286,6 +746,7 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
         act_desc = html.escape(str(action.get("description", "")))
         act_class = action.get("action_class", "read_only")
         req_approval = bool(action.get("requires_approval", False) or act_class == "REQUIRES_APPROVAL")
+        vlm_cached = bool(step.get("vlm_cached", False))
         obs = html.escape(str(step.get("observation_summary", "")))
         timestamp = html.escape(str(step.get("timestamp", "")))
         point = action.get("point")
@@ -294,6 +755,7 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
         key = html.escape(str(action.get("key", ""))) if action.get("key") else ""
 
         approval_badge = '<span class="badge badge-warning">⚠️ MUTATION APPROVAL REQUIRED</span>' if req_approval else ""
+        cached_badge = '<span class="badge badge-cached">⚡ VLM CACHED (pHash Gated)</span>' if vlm_cached else ""
 
         details = []
         if point:
@@ -304,6 +766,9 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
             details.append(f"<strong>Value:</strong> <code>{val}</code>")
         if key:
             details.append(f"<strong>Key:</strong> <code>{key}</code>")
+        vis_change = step.get("visual_change")
+        if vis_change is not None:
+            details.append(f"<strong>Visual Change:</strong> <code>{vis_change * 100.0:.2f}%</code>")
         details_html = " &nbsp;|&nbsp; ".join(details) if details else ""
 
         before_file = f"step_{idx:03d}_before.png"
@@ -338,6 +803,7 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
               <span class="step-number">Step #{idx}</span>
               <span class="badge badge-kind">{kind}</span>
               {approval_badge}
+              {cached_badge}
             </div>
             <div class="step-time">{timestamp}</div>
           </div>
@@ -492,6 +958,7 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
     }}
     .badge-kind {{ background: #1e293b; color: var(--color-primary); border: 1px solid #334155; }}
     .badge-warning {{ background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #d97706; }}
+    .badge-cached {{ background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid #0284c7; }}
     .step-time {{ font-size: 12px; color: var(--text-muted); }}
     .step-body {{ padding: 18px; }}
     .step-desc {{ font-size: 15px; font-weight: 600; color: var(--text-main); margin-bottom: 8px; }}
@@ -595,6 +1062,18 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
           <div class="metric-value">{duration}s</div>
         </div>
         <div class="metric-card">
+          <div class="metric-label">Skipped VLM Calls</div>
+          <div class="metric-value">{skipped_vlm_ticks}</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Tokens Saved</div>
+          <div class="metric-value">{tokens_saved:,}</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Cost Saved</div>
+          <div class="metric-value">${cost_saved:.4f}</div>
+        </div>
+        <div class="metric-card">
           <div class="metric-label">Recorded At</div>
           <div class="metric-value" style="font-size: 13px; font-weight: normal; margin-top: 6px;">{start_time or "N/A"}</div>
         </div>
@@ -639,6 +1118,13 @@ class ReachDriver:
         require_approval: bool = False,
         approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
         interactive: Optional[bool] = None,
+        min_change_threshold: float = 0.01,
+        max_unchanged_ticks: int = 3,
+        backoff_sec: float = 0.75,
+        roi: Optional[Union[List[int], Tuple[int, int, int, int], Roi, str]] = None,
+        lease_token: Optional[str] = None,
+        handoff_gen: Optional[int] = None,
+        step_callback: Optional[Callable[[StepRecord], None]] = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.screen = screen
@@ -652,6 +1138,18 @@ class ReachDriver:
         self.task_id = task_id or _generate_task_id()
         self.audit_dir = _resolve_audit_dir(audit_dir, self.task_id)
         self.enable_audit = enable_audit
+        self.min_change_threshold = min_change_threshold
+        self.max_unchanged_ticks = max_unchanged_ticks
+        self.backoff_sec = backoff_sec
+        self.roi = Roi.from_value(roi) if roi is not None else None
+        self.lease_token = lease_token
+        self.handoff_gen = handoff_gen
+        self.step_callback = step_callback
+        self.change_gate = PerceptualChangeGate(
+            min_change_threshold=min_change_threshold,
+            max_unchanged_ticks=max_unchanged_ticks,
+            backoff_sec=backoff_sec,
+        )
         self.approval_gate = ApprovalGate(
             allow_mutations=allow_mutations,
             require_approval=require_approval,
@@ -659,6 +1157,15 @@ class ReachDriver:
             approval_callback=approval_callback,
         )
         self._temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]] = None
+
+    def _record_step(self, steps: List[StepRecord], record: StepRecord) -> None:
+        """Append step record and notify step_callback if registered."""
+        steps.append(record)
+        if self.step_callback:
+            try:
+                self.step_callback(record)
+            except Exception as cb_err:
+                logger.warning("Step callback failed: %s", cb_err)
 
     def _archive_screenshot(self, src_path: str, filename: str) -> Optional[str]:
         """Save a screenshot into the visual audit directory."""
@@ -697,8 +1204,26 @@ class ReachDriver:
                 "duration_sec": round(max(0.0, end_time - start_time), 2),
                 "takeover_url": result.takeover_url,
                 "error": result.error,
+                "skipped_vlm_ticks": self.change_gate.skipped_vlm_ticks,
+                "tokens_saved": self.change_gate.tokens_saved,
+                "cost_saved": round(self.change_gate.cost_saved, 5),
+                "metrics": {
+                    "total_frames_evaluated": self.change_gate.total_frames_evaluated,
+                    "total_vlm_calls": self.change_gate.total_vlm_calls,
+                    "skipped_vlm_ticks": self.change_gate.skipped_vlm_ticks,
+                    "tokens_saved": self.change_gate.tokens_saved,
+                    "cost_saved": round(self.change_gate.cost_saved, 5),
+                    "min_change_threshold": self.min_change_threshold,
+                    "max_unchanged_ticks": self.max_unchanged_ticks,
+                    "cache_hit_rate": round(self.change_gate.cache_hit_rate, 4),
+                },
                 "steps": [s.to_dict() for s in result.steps],
             }
+            result.skipped_vlm_ticks = self.change_gate.skipped_vlm_ticks
+            result.tokens_saved = self.change_gate.tokens_saved
+            result.cost_saved = self.change_gate.cost_saved
+            result.metrics = meta["metrics"]
+
             meta_file = self.audit_dir / "audit_meta.json"
             with open(meta_file, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2)
@@ -750,7 +1275,12 @@ class ReachDriver:
         req = urllib.request.Request(f"{self.api_url}/agent/screens", method="GET")
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "[]")
+                screens = json.loads(r.read().decode("utf-8") or "[]")
+                if isinstance(screens, list):
+                    for s in screens:
+                        if isinstance(s, dict) and s.get("id") == self.screen and "handoff_gen" in s:
+                            self.handoff_gen = int(s["handoff_gen"])
+                return screens
         except Exception as e:
             logger.warning("Failed to query screens from %s: %s", self.api_url, e)
             return []
@@ -765,7 +1295,13 @@ class ReachDriver:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "{}")
+                data = json.loads(r.read().decode("utf-8") or "{}")
+                if isinstance(data, dict):
+                    if data.get("token"):
+                        self.lease_token = data["token"]
+                    if "handoff_gen" in data:
+                        self.handoff_gen = int(data["handoff_gen"])
+                return data
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error("Lease screen failed (%s): %s", e.code, body)
@@ -773,10 +1309,16 @@ class ReachDriver:
 
     def release_screen(self, owner: str) -> Dict[str, Any]:
         """Release leased screen."""
+        headers = {"content-type": "application/json"}
+        if self.lease_token:
+            headers["x-lease-token"] = self.lease_token
+        payload = {"owner": owner}
+        if self.lease_token:
+            payload["token"] = self.lease_token
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/lease",
-            data=json.dumps({"owner": owner}).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
             method="DELETE",
         )
         try:
@@ -786,20 +1328,33 @@ class ReachDriver:
             logger.warning("Release screen %s failed: %s", self.screen, e)
             return {"error": str(e)}
 
-    def set_takeover(self, pending: bool, url: Optional[str] = None) -> Dict[str, Any]:
+    def set_takeover(
+        self,
+        pending: bool,
+        url: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Set takeover pending state on Reach agent server."""
         payload: Dict[str, Any] = {"pending": pending}
         if url:
             payload["url"] = url
+        if reason:
+            payload["reason"] = reason
+        headers = {"content-type": "application/json"}
+        if self.lease_token:
+            headers["x-lease-token"] = self.lease_token
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/takeover",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "{}")
+                data = json.loads(r.read().decode("utf-8") or "{}")
+                if isinstance(data, dict) and "handoff_gen" in data:
+                    self.handoff_gen = int(data["handoff_gen"])
+                return data
         except Exception as e:
             logger.warning("Failed to set takeover for screen %s: %s", self.screen, e)
             return {"error": str(e)}
@@ -832,10 +1387,17 @@ class ReachDriver:
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": args_with_screen},
         }
+        headers = {"content-type": "application/json"}
+        if self.lease_token:
+            headers["x-lease-token"] = self.lease_token
+            if self.handoff_gen is None:
+                self.get_screens()
+            if self.handoff_gen is not None:
+                headers["x-handoff-gen"] = str(self.handoff_gen)
         req = urllib.request.Request(
             f"{self.api_url}/mcp",
             data=json.dumps(req_body).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -1087,6 +1649,8 @@ class ReachDriver:
             "type",
             "key",
             "navigate",
+            "wait",
+            "scroll",
             "auth_required",
             "terminate",
         ):
@@ -1099,6 +1663,10 @@ class ReachDriver:
                 kind = "terminate"
             elif kind in ("login", "2fa", "takeover"):
                 kind = "auth_required"
+            elif kind in ("sleep", "pause", "settle"):
+                kind = "wait"
+            elif kind in ("wheel", "swipe"):
+                kind = "scroll"
             else:
                 kind = "click"
 
@@ -1116,6 +1684,13 @@ class ReachDriver:
             except (ValueError, TypeError):
                 pass
 
+        roi = None
+        raw_roi = d.get("roi") or d.get("box") or d.get("bbox")
+        if raw_roi:
+            roi_obj = Roi.from_value(raw_roi)
+            if roi_obj:
+                roi = roi_obj.to_list()
+
         return ReachAction(
             kind=kind,
             action_class=str(d.get("actionClass", "read_only")),
@@ -1125,6 +1700,7 @@ class ReachDriver:
             key=d.get("key") or d.get("combo"),
             button=str(d.get("button", "left")),
             description=str(d.get("description", "")),
+            roi=roi,
         )
 
     # --------------------------------------------------------------------------
@@ -1149,6 +1725,14 @@ class ReachDriver:
         """Execute Reach action using Reach MCP tools or CLI fallback."""
         if action.kind == "terminate":
             return {"status": "ok", "action": "terminate"}
+
+        if action.kind == "wait":
+            time.sleep(0.5)
+            return {"status": "ok", "action": "wait"}
+
+        if action.kind == "scroll":
+            combo = action.key or "Page_Down"
+            return self.call_mcp_tool("key", {"combo": combo, "screen": self.screen})
 
         if action.kind == "click":
             x, y = action.point if action.point else (100, 100)
@@ -1255,22 +1839,81 @@ class ReachDriver:
                     self._finalize_audit(res, goal, start_time, time.time())
                     return res
 
+                # Evaluate visual change gate against previous frame
+                last_action_wait_or_scroll = (
+                    is_wait_or_scroll_action(steps[-1].action) if steps else False
+                )
+                gate_decision = self.change_gate.evaluate(
+                    screenshot_path, last_action_wait_or_scroll
+                )
+
+                if gate_decision.should_skip_vlm:
+                    logger.info("Step %s -> pHash Gate: %s", step_idx, gate_decision.reason)
+                    if gate_decision.backoff_sec > 0:
+                        time.sleep(gate_decision.backoff_sec)
+
+                    gate_action = ReachAction(
+                        kind="wait",
+                        description=(
+                            f"pHash gate: visual frame unchanged "
+                            f"({gate_decision.visual_distance * 100.0:.2f}% < {self.min_change_threshold * 100.0:.1f}%), "
+                            f"waiting for page/animation settle"
+                        ),
+                    )
+                    self._record_step(
+                        steps,
+                        StepRecord(
+                            step_index=step_idx,
+                            action=gate_action,
+                            observation_summary=f"pHash gated tick ({gate_decision.unchanged_ticks}/{self.max_unchanged_ticks})",
+                            screenshot_path=screenshot_path,
+                            after_screenshot_path=None,
+                            timestamp=step_timestamp,
+                            result={
+                                "status": "vlm_cached",
+                                "visual_change": gate_decision.visual_distance,
+                                "skipped_vlm_tick": True,
+                            },
+                            vlm_cached=True,
+                            visual_change=gate_decision.visual_distance,
+                            roi=self.roi.to_list() if self.roi else None,
+                        ),
+                    )
+                    continue
+
+                # Prepare screenshot for prompt: ROI crop if active, else full screenshot
+                vlm_screenshot_path = screenshot_path
+                roi_crop_path = None
+                if self.roi is not None:
+                    try:
+                        crop_filename = f"step_{step_idx:03d}_roi.png"
+                        crop_full_path = os.path.join(self._ensure_workdir(), crop_filename)
+                        crop_image(screenshot_path, self.roi, crop_full_path)
+                        vlm_screenshot_path = crop_full_path
+                        if self.enable_audit:
+                            roi_crop_path = self._archive_screenshot(crop_full_path, crop_filename)
+                    except Exception as crop_err:
+                        logger.debug("ROI crop failed, falling back to full screenshot: %s", crop_err)
+
                 prompt = self.build_prompt(
                     goal=goal,
-                    screenshot_path=screenshot_path,
+                    screenshot_path=vlm_screenshot_path,
                     page_text=page_text,
                     history=steps,
                     remaining_steps=remaining,
                 )
 
                 try:
-                    agy_output = self.invoke_agy(prompt, screenshot_path)
+                    agy_output = self.invoke_agy(prompt, vlm_screenshot_path)
                     action = self.parse_action(agy_output)
+                    if action.roi:
+                        self.roi = Roi.from_value(action.roi)
                 except Exception as model_err:
                     logger.error(
                         "Step %s model proposal failed: %s", step_idx, model_err
                     )
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=ReachAction(
@@ -1280,7 +1923,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             error=str(model_err),
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1304,7 +1947,8 @@ class ReachDriver:
                 if action.kind == "auth_required":
                     vnc_url = self.get_novnc_url()
                     self.set_takeover(True, vnc_url)
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
@@ -1314,7 +1958,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result={"status": "auth_required", "vnc_url": vnc_url},
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1329,7 +1973,8 @@ class ReachDriver:
 
                 # Handle termination
                 if action.kind == "terminate":
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
@@ -1339,7 +1984,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result={"status": "completed"},
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=True,
@@ -1361,7 +2006,8 @@ class ReachDriver:
                         "reason": danger_reason,
                     }
                     print(json.dumps(approval_notice), file=sys.stderr)
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
@@ -1371,7 +2017,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result=approval_notice,
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1407,7 +2053,8 @@ class ReachDriver:
                     except Exception as shot_err:
                         logger.debug("After screenshot capture skipped: %s", shot_err)
 
-                steps.append(
+                self._record_step(
+                    steps,
                     StepRecord(
                         step_index=step_idx,
                         action=action,
@@ -1417,7 +2064,11 @@ class ReachDriver:
                         timestamp=step_timestamp,
                         result=exec_result,
                         error=step_error,
-                    )
+                        vlm_cached=False,
+                        visual_change=gate_decision.visual_distance,
+                        roi=self.roi.to_list() if self.roi else None,
+                        roi_crop_path=roi_crop_path,
+                    ),
                 )
 
                 # Short delay for browser/display rendering
@@ -1450,6 +2101,10 @@ def drive_goal(
     allow_mutations: bool = False,
     require_approval: bool = False,
     approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
+    min_change_threshold: float = 0.01,
+    max_unchanged_ticks: int = 3,
+    backoff_sec: float = 0.75,
+    roi: Optional[Union[List[int], Tuple[int, int, int, int], Roi, str]] = None,
 ) -> DriveResult:
     """Convenience helper to drive a goal to completion."""
     driver = ReachDriver(
@@ -1463,6 +2118,10 @@ def drive_goal(
         allow_mutations=allow_mutations,
         require_approval=require_approval,
         approval_callback=approval_callback,
+        min_change_threshold=min_change_threshold,
+        max_unchanged_ticks=max_unchanged_ticks,
+        backoff_sec=backoff_sec,
+        roi=roi,
     )
     return driver.drive(goal=goal, initial_url=initial_url)
 
@@ -1502,6 +2161,35 @@ def main() -> None:
         action="store_false",
         dest="enable_audit",
         help="Disable visual diff audit reel generation",
+    )
+    parser.add_argument(
+        "--min-change-threshold",
+        type=float,
+        default=0.01,
+        help="pHash gating change threshold (0.0 to 1.0, default 0.01)",
+    )
+    parser.add_argument(
+        "--max-unchanged-ticks",
+        type=int,
+        default=3,
+        help="Maximum unchanged ticks before forcing VLM call (default 3)",
+    )
+    parser.add_argument(
+        "--backoff-sec",
+        type=float,
+        default=0.75,
+        help="Backoff seconds when VLM call is cached/skipped (default 0.75)",
+    )
+    parser.add_argument(
+        "--roi",
+        default=None,
+        help="Region of Interest crop 'x,y,width,height' to send to VLM",
+    )
+    parser.add_argument(
+        "--handoff-gen",
+        type=int,
+        default=None,
+        help="Expected handoff generation for mutating actions",
     )
     parser.add_argument(
         "--allow-mutations",
@@ -1544,6 +2232,11 @@ def main() -> None:
         allow_mutations=args.allow_mutations,
         require_approval=args.require_approval,
         interactive=not args.non_interactive,
+        min_change_threshold=args.min_change_threshold,
+        max_unchanged_ticks=args.max_unchanged_ticks,
+        backoff_sec=args.backoff_sec,
+        roi=args.roi,
+        handoff_gen=args.handoff_gen,
     )
 
     result = driver.drive(goal=args.goal, initial_url=args.initial_url)

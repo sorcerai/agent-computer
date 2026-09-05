@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Path inside the container where the durable workspace mount lands.
 pub const WORKSPACE_CONTAINER_PATH: &str = "/workspace";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SandboxConfig {
     pub name: String,
     pub image: String,
@@ -40,7 +40,32 @@ pub struct SandboxConfig {
     ///
     /// Never logged, never put in a container label — round-tripped for
     /// `recreate` via the container's `VNC_PASSWORD` env var instead.
+    ///
+    /// Note: because the password is passed via the container's `VNC_PASSWORD`
+    /// environment variable, it is visible to any process or user with access
+    /// to `docker inspect`.
     pub vnc_password: Option<String>,
+}
+
+impl std::fmt::Debug for SandboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxConfig")
+            .field("name", &self.name)
+            .field("image", &self.image)
+            .field("resolution", &self.resolution)
+            .field("shm_size", &self.shm_size)
+            .field("ports", &self.ports)
+            .field("screens", &self.screens)
+            .field("profile", &self.profile)
+            .field("workspace", &self.workspace)
+            .field("memory", &self.memory)
+            .field("restart_unless_stopped", &self.restart_unless_stopped)
+            .field(
+                "vnc_password",
+                &self.vnc_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Bind mount that backs a persistent Chrome profile.
@@ -511,6 +536,8 @@ impl DockerClient {
             } else {
                 Some(mounts)
             },
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             ..Default::default()
         };
 
@@ -746,6 +773,7 @@ impl DockerClient {
             "selector": opts.selector,
             "timeout_ms": opts.timeout_ms,
             "user_data_dir": opts.user_data_dir,
+            "hydrated_cookies": opts.hydrated_cookies,
         });
 
         let payload_str =
@@ -944,6 +972,7 @@ pub struct PageTextOptions {
     /// Persistent Chrome user data dir inside the container.
     pub user_data_dir: Option<String>,
     pub display: Option<String>,
+    pub hydrated_cookies: Option<Vec<crate::profile::Cookie>>,
 }
 
 /// Parsed output from the embedded `page_text` Python helper.
@@ -958,6 +987,8 @@ pub struct PageTextOutput {
     pub title: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub cookies: Vec<crate::profile::Cookie>,
 }
 
 /// Inputs to [`DockerClient::auth_handoff`].
@@ -1041,6 +1072,7 @@ wait_for = payload.get("wait_for")
 selector = payload.get("selector")
 timeout_ms = int(payload.get("timeout_ms") or 30000)
 user_data_dir = payload.get("user_data_dir")
+hydrated_cookies = payload.get("hydrated_cookies") or []
 
 if not url:
     print(json.dumps({"status": "error", "message": "missing url"}))
@@ -1063,9 +1095,19 @@ try:
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
             )
+            if hydrated_cookies:
+                try:
+                    import time
+                    now = time.time()
+                    for c in hydrated_cookies:
+                        if c.get("expires", -1) <= 0:
+                            c["expires"] = int(now + 86400 * 30)
+                    ctx.add_cookies(hydrated_cookies)
+                except Exception:
+                    pass
             has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
             state_file = "/workspace/.reach/state.json"
-            if not has_cookies and os.path.exists(state_file):
+            if not has_cookies and not hydrated_cookies and os.path.exists(state_file):
                 try:
                     with open(state_file) as f:
                         state = json.load(f)
@@ -1094,6 +1136,16 @@ try:
                     ctx = browser.new_context()
             else:
                 ctx = browser.new_context()
+            if hydrated_cookies:
+                try:
+                    import time
+                    now = time.time()
+                    for c in hydrated_cookies:
+                        if c.get("expires", -1) <= 0:
+                            c["expires"] = int(now + 86400 * 30)
+                    ctx.add_cookies(hydrated_cookies)
+                except Exception:
+                    pass
             page = ctx.new_page()
             owner = browser
 
@@ -1113,11 +1165,17 @@ try:
             else:
                 text = page.locator("body").inner_text()
 
+            try:
+                cookies_out = ctx.cookies()
+            except Exception:
+                cookies_out = []
+
             result = {
                 "status": "ok",
                 "url": page.url,
                 "title": page.title(),
                 "text": text,
+                "cookies": cookies_out,
             }
         finally:
             try:

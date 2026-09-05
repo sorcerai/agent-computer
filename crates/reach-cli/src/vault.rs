@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn test_base32_decoding() {
         // "12345678901234567890" in Base32
-        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
         let decoded = decode_base32(secret).unwrap();
         assert_eq!(decoded, b"12345678901234567890");
 
@@ -660,7 +660,7 @@ mod tests {
         // From RFC 6238 Appendix B: Test Vectors for SHA1
         // Secret in ASCII: "12345678901234567890"
         // Base32: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
 
         // RFC 6238 Table 1 (SHA1 8-digit codes: the last 6 digits match 6-digit TOTP)
         // Time = 59s: 8-digit = 94287082 -> 6-digit = 287082

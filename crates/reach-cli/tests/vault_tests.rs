@@ -76,7 +76,7 @@ fn test_rfc6238_official_test_table_vectors() {
     // From RFC 6238 Appendix B: Test Vectors for SHA1
     // Shared secret: "12345678901234567890" (ASCII)
     // Base32: "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-    let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
 
     let test_vectors = vec![
         (59u64, "287082"),

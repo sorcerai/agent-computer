@@ -28,7 +28,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 bollard = "0.18"
 tower = "0.5"
 base64 = "0.22"
@@ -40,3 +40,6 @@ toml = "0.8"
 futures = "0.3"
 tokio-stream = "0.1"
 colored = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+fs4 = { version = "1.1.0", features = ["sync"] }
+libc = "0.2"

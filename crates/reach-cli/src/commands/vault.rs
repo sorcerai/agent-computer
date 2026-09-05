@@ -229,6 +229,9 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
         docker: &docker,
         public_host: cfg.server.effective_public_host(),
         agent: None,
+        profile_broker: None,
+        cookie_jars: None,
+        owner: None,
     };
 
     tracing::info!(domain = %norm, target = %target, screen = args.screen, "injecting credentials");

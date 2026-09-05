@@ -92,12 +92,12 @@ RUN chmod +x /usr/local/bin/reach-chrome /usr/local/bin/reach-wallpaper /usr/loc
     && mkdir -p /etc/chromium/policies/managed /opt/reach \
     && chmod -R a+rX /opt/ms-playwright
 COPY assets/home.html /opt/reach/home.html
-RUN chmod -R a+rX /opt/reach
+COPY assets/reach-banner.js /opt/noVNC/reach-banner.js
+RUN chmod -R a+rX /opt/reach /opt/noVNC/reach-banner.js
 COPY config/chrome-policies.json /etc/chromium/policies/managed/reach.json
 
 # Layer 7: User + permissions + X11 socket dir
 RUN useradd -m -s /bin/bash sandbox \
-    && echo "sandbox ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers \
     && mkdir -p /tmp/.X11-unix \
     && chmod 1777 /tmp/.X11-unix
 
