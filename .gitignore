@@ -38,3 +38,6 @@ tarpaulin-report.html
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Agent tools / skills local symlinks
+.agents/

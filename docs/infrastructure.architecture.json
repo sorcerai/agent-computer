@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Hermes Agent & Agent-Computer Infrastructure",
+    "subtitle": "AXI Token Optimization · OrbStack MicroVM · Docker Desktop Sandbox · Anti-Bot Stealth Evasion",
+    "output": "infrastructure.html"
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "User / Operator",
+      "sublabel": "CLI · REPL · Slash",
+      "pos": [40, 260],
+      "size": [130, 56]
+    },
+    {
+      "id": "hermes_cli",
+      "type": "frontend",
+      "label": "Hermes CLI Layer",
+      "sublabel": "TOON · Did-You-Mean",
+      "pos": [200, 260],
+      "size": [140, 56],
+      "tag": "-71% tokens"
+    },
+    {
+      "id": "agent_core",
+      "type": "backend",
+      "label": "Hermes Agent Core",
+      "sublabel": "Turn Loop · Cache",
+      "pos": [370, 260],
+      "size": [140, 56],
+      "tag": "byte-stable"
+    },
+    {
+      "id": "plugin_bridge",
+      "type": "backend",
+      "label": "reach-agent-computer",
+      "sublabel": "Plugin · Tool Registry",
+      "pos": [370, 400],
+      "size": [140, 56]
+    },
+    {
+      "id": "orbstack",
+      "type": "cloud",
+      "label": "OrbStack MicroVM",
+      "sublabel": "Apple Virt.framework",
+      "pos": [540, 120],
+      "size": [150, 56],
+      "tag": "APFS CoW <300ms"
+    },
+    {
+      "id": "reach_daemon",
+      "type": "backend",
+      "label": "Reach Rust Daemon",
+      "sublabel": "reach serve :4200",
+      "pos": [540, 260],
+      "size": [150, 56],
+      "tag": "HTTP/JSON-RPC"
+    },
+    {
+      "id": "profile_broker",
+      "type": "security",
+      "label": "ProfileBroker",
+      "sublabel": "Concurrency & Leases",
+      "pos": [540, 400],
+      "size": [150, 56],
+      "tag": "fail-closed"
+    },
+    {
+      "id": "axi_engine",
+      "type": "messagebus",
+      "label": "AXI Engine",
+      "sublabel": "Single-Turn · @eN",
+      "pos": [720, 260],
+      "size": [150, 56],
+      "tag": "-95% tokens"
+    },
+    {
+      "id": "docker_sandbox",
+      "type": "backend",
+      "label": "Docker Sandbox",
+      "sublabel": "reach-supervisor (PID 1)",
+      "pos": [720, 400],
+      "size": [150, 56],
+      "tag": "<200ms reset"
+    },
+    {
+      "id": "novnc_stream",
+      "type": "frontend",
+      "label": "noVNC Live View",
+      "sublabel": "x11vnc · Websockify",
+      "pos": [900, 120],
+      "size": [150, 56],
+      "tag": "port 6080 / 8400"
+    },
+    {
+      "id": "stealth_chrome",
+      "type": "frontend",
+      "label": "Stealth Chrome",
+      "sublabel": "Headed on Xvfb (:99)",
+      "pos": [900, 260],
+      "size": [150, 56],
+      "tag": "webdriver=false"
+    },
+    {
+      "id": "cloudflare",
+      "type": "security",
+      "label": "Cloudflare Perimeter",
+      "sublabel": "Turnstile · WAF Challenge",
+      "pos": [900, 400],
+      "size": [150, 56],
+      "tag": "100% verified"
+    },
+    {
+      "id": "target_web",
+      "type": "cloud",
+      "label": "Target Web Apps",
+      "sublabel": "H-E-B · Wiki · SPAs",
+      "pos": [1080, 260],
+      "size": [140, 56]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Hermes Agent Host (macOS)",
+      "wraps": ["operator", "hermes_cli", "agent_core", "plugin_bridge"]
+    },
+    {
+      "kind": "region",
+      "label": "OrbStack MicroVM (reach-lab · 192.168.139.232)",
+      "wraps": ["orbstack", "reach_daemon", "profile_broker", "axi_engine"]
+    },
+    {
+      "kind": "region",
+      "label": "Agent-Computer Sandbox (reach:latest · Xvfb :99)",
+      "wraps": ["docker_sandbox", "novnc_stream", "stealth_chrome"]
+    },
+    {
+      "kind": "region",
+      "label": "External Web & Anti-Bot Perimeter",
+      "wraps": ["cloudflare", "target_web"]
+    }
+  ],
+  "connections": [
+    {
+      "from": "operator",
+      "to": "hermes_cli",
+      "variant": "emphasis"
+    },
+    {
+      "from": "hermes_cli",
+      "to": "agent_core",
+      "variant": "emphasis"
+    },
+    {
+      "from": "agent_core",
+      "to": "plugin_bridge",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "agent_core",
+      "to": "reach_daemon",
+      "variant": "emphasis"
+    },
+    {
+      "from": "reach_daemon",
+      "to": "orbstack",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "reach_daemon",
+      "to": "profile_broker",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "reach_daemon",
+      "to": "axi_engine",
+      "variant": "emphasis"
+    },
+    {
+      "from": "axi_engine",
+      "to": "docker_sandbox",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "axi_engine",
+      "to": "stealth_chrome",
+      "variant": "emphasis"
+    },
+    {
+      "from": "stealth_chrome",
+      "to": "novnc_stream",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "stealth_chrome",
+      "to": "cloudflare",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "stealth_chrome",
+      "to": "target_web",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "AXI Token Optimization",
+      "items": [
+        "Single-turn browse combines navigation + compact AXTree snapshot (1.5s - 2.8s)",
+        "Server-side Rust query filtering reduces token payloads by 73% to 98% (-95% avg)",
+        "Zero-dependency TOON serializer strips 26% to 69% of JSON boilerplate for CLI tools",
+        "Did-You-Mean subcommand typo error walls slashed from 566 to 30 tokens (-94.7%)"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "MicroVM & Sandbox Engine",
+      "items": [
+        "OrbStack on macOS Virtualization.framework provides APFS CoW clones in <300ms",
+        "Isolated Docker container (reach:latest) enables sub-200ms cgroup process wipes",
+        "ProfileBroker enforces atomic lock leasing and prevents multi-session screen collisions",
+        "Dedicated routable IPv4 bridge (192.168.139.232) per microVM instance"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Stealth & Anti-Bot Evasion",
+      "items": [
+        "Headed Google Chrome running on Xvfb (:99) masks navigator.webdriver heuristics",
+        "Live-verified Cloudflare Turnstile interactive checkbox solving with signed token emit",
+        "Passes bot.sannysoft.com test battery (WebDriver missing, Chrome runtime present)",
+        "Persistent domain cookie jars maintain cart & auth sessions across resets (e.g. H-E-B)"
+      ]
+    }
+  ]
+}

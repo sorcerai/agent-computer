@@ -19,7 +19,7 @@ for p in (str(PLUGIN_DIR), str(REPO_ROOT)):
 import __init__ as plugin  # noqa: E402
 from __init__ import (  # noqa: E402
     get_state, on_session_finalize, on_session_start, post_tool_call, pre_llm_call, pre_tool_call,
-    reach_drive, reach_lease_screen, reach_release_screen, reach_status, register, reset_state,
+    reach_drive, reach_lease_screen, reach_release_screen, reach_smart_browse, reach_status, register, reset_state,
 )
 
 
@@ -49,7 +49,27 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
             self._respond(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        body, screen = self._body(), self._screen() if self.path.startswith("/agent/screens/") else None
+        body = self._body()
+        if self.path == "/mcp":
+            tool_name = body.get("params", {}).get("name", "")
+            tool_args = body.get("params", {}).get("arguments", {})
+            return self._respond(200, {
+                "jsonrpc": "2.0",
+                "id": body.get("id", 1),
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
+                            "title": "Mock Title",
+                            "status": "ok",
+                            "url": tool_args.get("url", ""),
+                            "elements_count": 42,
+                        }),
+                    }],
+                    "isError": False,
+                },
+            })
+        screen = self._screen() if self.path.startswith("/agent/screens/") else None
         if screen is None:
             return self._respond(404, {"error": "not found"})
         if self.path.endswith("/lease"):
@@ -128,7 +148,7 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
     def test_register_attaches_hooks_and_tools(self) -> None:
         self.assertEqual(set(self.ctx.hooks), {"on_session_start", "pre_llm_call", "pre_tool_call",
                                                "post_tool_call", "on_session_finalize"})
-        self.assertEqual(set(self.ctx.tools), {"reach_lease_screen", "reach_release_screen", "reach_status", "reach_drive"})
+        self.assertEqual(set(self.ctx.tools), {"reach_lease_screen", "reach_release_screen", "reach_status", "reach_drive", "reach_smart_browse"})
         out = json.loads(self.ctx.tools["reach_status"]({}))  # registry handler convention: handler(args_dict)
         self.assertEqual(out["status"], "ok")
 
@@ -192,6 +212,34 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
         self.assertEqual(out["status"], "completed")
         mock_driver_cls.assert_called_once_with(api_url=self.api_url, screen=0, max_steps=15)
         inst.drive.assert_called_once_with(goal="Log in and check dashboard", initial_url=None)
+
+    @patch("__init__._try_obscura")
+    def test_reach_smart_browse_obscura_hit(self, mock_obscura: MagicMock) -> None:
+        mock_obscura.return_value = (True, "# Fast Markdown Output", 65.2)
+        res = reach_smart_browse(url="https://news.ycombinator.com", api_url=self.api_url)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["tier"], "Tier 1 (Obscura Fast Path)")
+        self.assertEqual(res["content"], "# Fast Markdown Output")
+        self.assertIn("latency_ms", res)
+        mock_obscura.assert_called_once_with("https://news.ycombinator.com")
+
+    @patch("__init__._try_obscura")
+    def test_reach_smart_browse_antibot_escalates_to_reach(self, mock_obscura: MagicMock) -> None:
+        mock_obscura.return_value = (False, "Anti-bot signature detected: 'cloudflare turnstile'", 120.0)
+        res = reach_smart_browse(url="https://protected.example.com", api_url=self.api_url, screen=1)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["tier"], "Tier 2 (Reach MicroVM Headed Chrome)")
+        self.assertIn("cloudflare turnstile", res["escalation_reason"])
+        self.assertEqual(res["data"]["title"], "Mock Title")
+        self.assertEqual(res["data"]["status"], "ok")
+
+    @patch("__init__._try_obscura")
+    def test_reach_smart_browse_force_headed(self, mock_obscura: MagicMock) -> None:
+        res = reach_smart_browse(url="https://example.com", api_url=self.api_url, screen=0, force_headed=True)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["tier"], "Tier 2 (Reach MicroVM Headed Chrome)")
+        self.assertEqual(res["escalation_reason"], "force_headed requested")
+        mock_obscura.assert_not_called()
 
 
 if __name__ == "__main__":

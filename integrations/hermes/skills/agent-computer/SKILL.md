@@ -9,7 +9,7 @@ You have a persistent Linux desktop with Chromium. The human can watch it live a
 
 ## Loop
 1. **Announce the screen.** At the start of any browser/desktop task call `live_view` once and tell the user: `Watch here: <novnc_url>`.
-2. **Read with text first.** Use `page_text` (JS-rendered) or `scrape` (static). Use `screenshot` only to confirm layout or when text extraction fails. Use `browse` to open a page for the human to see.
+2. **Read with text first.** Prefer `reach_smart_browse` for adaptive tiered fetching (Tier 1 Obscura fast-path ~50-350ms with automatic escalation to Tier 2 headed Chrome on anti-bot/challenges). Alternatively use `page_text` (JS-rendered) or `scrape` (static). Use `screenshot` only to confirm layout or when text extraction fails. Use `browse` to open a page for the human to see.
 3. **Logins are the human's job.** If a page shows a login, 2FA, CAPTCHA, or "verify it's you":
    - call `auth_handoff` with the URL (profile `default`),
    - tell the user: `Take over at <vnc_url>, log in, then tell me "done"`,

@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger("hermes.plugins.reach_agent_computer")
 
@@ -76,11 +76,15 @@ def _http_request(
     api_url: Optional[str] = None,
     timeout: float = 10.0,
 ) -> Any:
+    import urllib.parse
     import urllib.request
 
     base = (api_url or get_api_url()).rstrip("/")
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"content-type": "application/json"} if data is not None else {}
+    parsed = urllib.parse.urlparse(base)
+    if parsed.port == 4200:
+        headers["Host"] = f"127.0.0.1:{parsed.port}"
     req = urllib.request.Request(f"{base}{path}", data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
@@ -191,6 +195,143 @@ def reach_drive(
         return {"status": "failed", "error": str(e)}
 
 
+ANTIBOT_SIGNATURES = [
+    "just a moment...",
+    "attention required! | cloudflare",
+    "cloudflare turnstile",
+    "checking your browser before accessing",
+    "verify you are human",
+    "access denied",
+    "403 forbidden",
+    "security check",
+    "failed to execute attachshadow",
+    "minified react error",
+]
+
+
+def _try_obscura(url: str, timeout: int = 10) -> Tuple[bool, str, float]:
+    """Attempts Tier 1 fast fetch with Obscura. Returns (passed_antibot, content, elapsed_ms)."""
+    import shutil
+    import subprocess
+    import time
+
+    obscura_bin = shutil.which("obscura") or os.path.expanduser("~/.local/bin/obscura")
+    if not (os.path.isfile(obscura_bin) and os.access(obscura_bin, os.X_OK)):
+        return False, "Obscura binary not installed or executable", 0.0
+
+    start = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            [obscura_bin, "fetch", url, "--dump", "markdown", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        output = proc.stdout or ""
+        stderr = proc.stderr or ""
+
+        if proc.returncode != 0:
+            return False, f"Obscura exit {proc.returncode}: {stderr.strip()}", elapsed_ms
+
+        combined = (output + "\n" + stderr).lower()
+        for sig in ANTIBOT_SIGNATURES:
+            if sig in combined:
+                return False, f"Anti-bot signature detected: '{sig}'", elapsed_ms
+
+        if not output.strip():
+            return False, "Obscura returned empty content", elapsed_ms
+
+        return True, output, elapsed_ms
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return False, f"Obscura exception: {e}", elapsed_ms
+
+
+def _reach_mcp_call(
+    method_name: str,
+    arguments: Dict[str, Any],
+    api_url: Optional[str] = None,
+    timeout: float = 35.0,
+) -> Any:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": method_name, "arguments": arguments},
+    }
+    return _http_request("/mcp", method="POST", body=payload, api_url=api_url, timeout=timeout)
+
+
+def reach_smart_browse(
+    url: str,
+    screen: Optional[int] = None,
+    api_url: Optional[str] = None,
+    query: Optional[str] = None,
+    force_headed: bool = False,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """Adaptive two-tier browser:
+    Tier 1: Obscura headless Rust engine (~50-350ms) for fast markdown extraction.
+    Detection: Anti-bot checks (Cloudflare, Turnstile, 403, React hydration).
+    Tier 2: Escalation to Reach MicroVM headed Chrome when anti-bot or JS hydration fails.
+    """
+    import time
+
+    target_screen = screen if screen is not None else (_state.get("screen") or 0)
+    t0 = time.perf_counter()
+
+    if not force_headed:
+        passed, obscura_res, ms_obscura = _try_obscura(url)
+        if passed:
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            return {
+                "status": "ok",
+                "tier": "Tier 1 (Obscura Fast Path)",
+                "url": url,
+                "latency_ms": round(total_ms, 1),
+                "format": "markdown",
+                "content": obscura_res,
+            }
+        escalation_reason = obscura_res
+    else:
+        escalation_reason = "force_headed requested"
+
+    try:
+        args: Dict[str, Any] = {"url": url, "snapshot": True, "screen": target_screen}
+        if query:
+            args["query"] = query
+        mcp_res = _reach_mcp_call("browse", args, api_url=api_url, timeout=float(timeout))
+        total_ms = (time.perf_counter() - t0) * 1000.0
+
+        content_list = mcp_res.get("result", {}).get("content", [])
+        raw_text = content_list[0].get("text", "") if content_list else ""
+        try:
+            reach_data = json.loads(raw_text)
+        except Exception:
+            reach_data = {"raw": raw_text}
+
+        return {
+            "status": "ok",
+            "tier": "Tier 2 (Reach MicroVM Headed Chrome)",
+            "url": url,
+            "escalation_reason": escalation_reason,
+            "latency_ms": round(total_ms, 1),
+            "screen": target_screen,
+            "data": reach_data,
+        }
+    except Exception as e:
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "status": "error",
+            "tier": "Tier 2 (Reach MicroVM)",
+            "url": url,
+            "escalation_reason": escalation_reason,
+            "latency_ms": round(total_ms, 1),
+            "message": f"Reach browse failed: {e}",
+        }
+
+
 # --------------------------------------------------------------------------
 # Lifecycle hooks
 # --------------------------------------------------------------------------
@@ -273,6 +414,20 @@ PLUGIN_TOOLS: Dict[str, tuple] = {
                         "max_steps": {"type": "integer", "default": 15, "description": "Maximum vision-action steps."},
                         "initial_url": {"type": "string", "description": "Optional URL to open before the loop starts."},
                     }}),
+    "reach_smart_browse": (
+        reach_smart_browse,
+        "Adaptive tiered browser: fast local markdown scrape (~50-350ms) with automatic fallback to Reach headed Chrome on anti-bot/challenges.",
+        {
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": {"type": "string", "description": "URL to fetch or browse."},
+                "screen": _SCREEN,
+                "query": {"type": "string", "description": "Optional search/query filter."},
+                "force_headed": {"type": "boolean", "description": "Bypass fast path and force headed Chrome."},
+            },
+        },
+    ),
 }
 
 

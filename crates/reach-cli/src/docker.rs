@@ -1166,7 +1166,7 @@ try:
         # Probe connecting over CDP to an existing headed browser session (e.g. from browse)
         for attempt in range(3):
             try:
-                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}", timeout=500)
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}", timeout=3000)
                 if browser.contexts:
                     ctx = browser.contexts[0]
                 else:
@@ -1174,6 +1174,14 @@ try:
                 if ctx.pages:
                     matching = [pg for pg in ctx.pages if url and (url in pg.url or pg.url in url)]
                     page = matching[-1] if matching else ctx.pages[-1]
+                    # Prune extra about:blank pages to prevent resource bloat
+                    if len(ctx.pages) > 5:
+                        for pg in ctx.pages[:-1]:
+                            if pg != page and (pg.url == "about:blank" or not pg.url):
+                                try:
+                                    pg.close()
+                                except Exception:
+                                    pass
                 else:
                     page = ctx.new_page()
                 owner = browser
@@ -1182,7 +1190,7 @@ try:
             except Exception:
                 if attempt < 2:
                     import time
-                    time.sleep(0.15)
+                    time.sleep(0.3)
 
         if not connected_cdp:
             if user_data_dir:
